@@ -1,5 +1,5 @@
 use crate::model::{ChangeError, Operation, Patch, conflict, invalid, matching_ranges};
-use pos_vault::{NoteSource, inspect_markdown};
+use pos_vault::{NoteSource, inspect_markdown, prepare_property};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -30,7 +30,13 @@ pub struct OperationRegistry {
 
 impl Default for OperationRegistry {
     fn default() -> Self {
-        let handlers: [Box<dyn OperationHandler>; 2] = [Box::new(LinkAdd), Box::new(LinkRemove)];
+        let handlers: [Box<dyn OperationHandler>; 5] = [
+            Box::new(LinkAdd),
+            Box::new(LinkRemove),
+            Box::new(MarkdownReplace),
+            Box::new(PropertyUpdate("property.set")),
+            Box::new(PropertyUpdate("property.remove")),
+        ];
         Self {
             handlers: handlers
                 .into_iter()
@@ -46,7 +52,7 @@ impl OperationRegistry {
         handler: impl OperationHandler + 'static,
     ) -> Result<(), ChangeError> {
         let key = (handler.kind(), handler.payload_version());
-        if key.0 == "change.revert"
+        if matches!(key.0, "change.revert" | "note.create" | "external.observe")
             || key.0.trim().is_empty()
             || key.1 == 0
             || self.handlers.contains_key(&key)
@@ -74,6 +80,37 @@ impl OperationRegistry {
 }
 
 impl Operation {
+    pub fn create_note(text: &str) -> Self {
+        Self {
+            kind: "note.create".into(),
+            payload_version: 1,
+            payload: json!(text),
+        }
+    }
+
+    pub fn replace_markdown(start: usize, end: usize, text: &str) -> Self {
+        Self {
+            kind: "markdown.replace".into(),
+            payload_version: 1,
+            payload: json!({ "start": start, "end": end, "text": text }),
+        }
+    }
+
+    pub fn set_property(key: &str, value: serde_json::Value) -> Self {
+        Self {
+            kind: "property.set".into(),
+            payload_version: 1,
+            payload: json!({ "key": key, "value": value }),
+        }
+    }
+
+    pub fn remove_property(key: &str) -> Self {
+        Self {
+            kind: "property.remove".into(),
+            payload_version: 1,
+            payload: json!({ "key": key }),
+        }
+    }
     pub fn link_add(text: &str, target: &str, offset: Option<usize>) -> Self {
         Self {
             kind: "link.add".into(),
@@ -108,6 +145,73 @@ struct RemovePayload {
 
 struct LinkAdd;
 struct LinkRemove;
+struct MarkdownReplace;
+struct PropertyUpdate(&'static str);
+
+impl OperationHandler for MarkdownReplace {
+    fn kind(&self) -> &'static str {
+        "markdown.replace"
+    }
+
+    fn prepare(
+        &self,
+        operation: &Operation,
+        _source: &NoteSource,
+    ) -> Result<OperationEdit, ChangeError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Payload {
+            start: usize,
+            end: usize,
+            text: String,
+        }
+        let payload: Payload = serde_json::from_value(operation.payload.clone())?;
+        Ok(OperationEdit {
+            range: payload.start..payload.end,
+            replacement: payload.text,
+            reads: Vec::new(),
+            reversible: true,
+        })
+    }
+}
+
+impl OperationHandler for PropertyUpdate {
+    fn kind(&self) -> &'static str {
+        self.0
+    }
+
+    fn prepare(
+        &self,
+        operation: &Operation,
+        source: &NoteSource,
+    ) -> Result<OperationEdit, ChangeError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Set {
+            key: String,
+            value: serde_json::Value,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Remove {
+            key: String,
+        }
+        let (key, value) = if self.0 == "property.set" {
+            let set: Set = serde_json::from_value(operation.payload.clone())?;
+            (set.key, Some(set.value))
+        } else {
+            let remove: Remove = serde_json::from_value(operation.payload.clone())?;
+            (remove.key, None)
+        };
+        let edit = prepare_property(&source.text, &key, value).map_err(invalid)?;
+        Ok(OperationEdit {
+            range: edit.range,
+            replacement: edit.replacement,
+            reads: Vec::new(),
+            reversible: true,
+        })
+    }
+}
 
 impl OperationHandler for LinkAdd {
     fn kind(&self) -> &'static str {

@@ -26,6 +26,24 @@ pub(crate) enum ChangeAction {
     Show { id: Uuid },
     /// Show the original stored difference.
     Diff { id: Uuid },
+    /// Preview a registered operation using its versioned JSON payload.
+    Preview {
+        path: String,
+        kind: String,
+        #[arg(long, default_value_t = 1)]
+        version: u32,
+        #[arg(long)]
+        payload: String,
+        #[command(flatten)]
+        actor: Actor,
+    },
+    /// Record external Vault changes against a stored baseline.
+    Observe {
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        watch: bool,
+    },
     /// Preview the conditional inverse of a completed change.
     #[command(visible_alias = "revert")]
     Undo {
@@ -47,9 +65,31 @@ pub(crate) enum ChangeAction {
         /// Confirm attribution of matching post-replacement bytes.
         #[arg(long, requires = "resolve")]
         accept_written: bool,
+        /// Close a conflict while retaining the current note and recovery evidence.
+        #[arg(long, requires = "resolve", conflicts_with = "accept_written")]
+        keep_current: bool,
         /// Confirm that other editors and sync writers are paused for the file.
         #[arg(long, requires = "resolve")]
         exclusive: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BackupAction {
+    /// Capture a Vault and its Change history into a new directory.
+    Create {
+        #[arg(long)]
+        root: PathBuf,
+        destination: PathBuf,
+        #[arg(long)]
+        exclusive: bool,
+    },
+    /// Verify bytes, SQLite history, and content objects in an archive.
+    Verify { snapshot: PathBuf },
+    /// Restore a verified archive into a new directory.
+    Restore {
+        snapshot: PathBuf,
+        destination: PathBuf,
     },
 }
 
@@ -86,6 +126,31 @@ pub(crate) fn run(root: PathBuf, action: ChangeAction) -> Result<(), Box<dyn Err
         ChangeAction::List => emit(&engine.list()?),
         ChangeAction::Show { id } => emit(&engine.show(id)?),
         ChangeAction::Diff { id } => emit(&engine.diff(id)?),
+        ChangeAction::Preview {
+            path,
+            kind,
+            version,
+            payload,
+            actor,
+        } => {
+            let operation = Operation {
+                kind,
+                payload_version: version,
+                payload: serde_json::from_str(&payload)?,
+            };
+            preview(&engine, path, operation, actor)
+        }
+        ChangeAction::Observe {
+            actor,
+            watch: false,
+        } => emit(&engine.observe(&actor)?),
+        ChangeAction::Observe { actor, watch: true } => {
+            let observer = engine.watch_vault()?;
+            loop {
+                emit(&engine.observe(&actor)?)?;
+                observer.wait_for_change()?;
+            }
+        }
         ChangeAction::Undo { id, actor } => {
             emit(&engine.preview_revert(id, actor.actor, actor.device, actor.reason)?)
         }
@@ -99,10 +164,15 @@ pub(crate) fn run(root: PathBuf, action: ChangeAction) -> Result<(), Box<dyn Err
         ChangeAction::Recover {
             resolve: Some(id),
             accept_written,
+            keep_current,
             exclusive,
         } => {
             let exclusive = write_access(exclusive)?;
-            emit(&engine.resolve(id, accept_written, &exclusive)?)
+            if keep_current {
+                emit(&engine.keep_current(id, &exclusive)?)
+            } else {
+                emit(&engine.resolve(id, accept_written, &exclusive)?)
+            }
         }
     }
 }
@@ -124,6 +194,15 @@ pub(crate) fn link(root: PathBuf, action: LinkAction) -> Result<(), Box<dyn Erro
             actor,
         } => (path, Operation::link_remove(&link, offset), actor),
     };
+    preview(&engine, path, operation, actor)
+}
+
+fn preview(
+    engine: &ChangeEngine,
+    path: String,
+    operation: Operation,
+    actor: Actor,
+) -> Result<(), Box<dyn Error>> {
     emit(&engine.preview(ChangeRequest {
         change_id: Uuid::new_v4(),
         path,
@@ -134,10 +213,31 @@ pub(crate) fn link(root: PathBuf, action: LinkAction) -> Result<(), Box<dyn Erro
     })?)
 }
 
+pub(crate) fn backup(action: BackupAction) -> Result<(), Box<dyn Error>> {
+    match action {
+        BackupAction::Create {
+            root,
+            destination,
+            exclusive,
+        } => {
+            let exclusive = write_access(exclusive)?;
+            emit(&pos_change::create_backup(&root, &destination, &exclusive)?)
+        }
+        BackupAction::Verify { snapshot } => emit(&pos_change::verify_backup(&snapshot)?),
+        BackupAction::Restore {
+            snapshot,
+            destination,
+        } => emit(&pos_change::restore_backup(&snapshot, &destination)?),
+    }
+}
+
 fn write_access(exclusive: bool) -> Result<ExclusiveWrite, Box<dyn Error>> {
     if exclusive {
         Ok(ExclusiveWrite::confirmed())
     } else {
-        Err("confirm exclusive access to the note with --exclusive".into())
+        Err(
+            "confirm other writers are paused for the affected note or Vault with --exclusive"
+                .into(),
+        )
     }
 }

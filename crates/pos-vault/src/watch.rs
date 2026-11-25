@@ -1,9 +1,17 @@
 use crate::VaultError;
 use crate::vault::visible;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Serialize)]
+pub struct VaultChanges {
+    pub paths: Vec<PathBuf>,
+    pub rescan: bool,
+}
 
 pub struct VaultWatch {
     _watcher: RecommendedWatcher,
@@ -25,12 +33,19 @@ impl VaultWatch {
 
     /// Block until an observed vault change, coalescing an initial burst of events.
     pub fn wait_for_change(&self) -> Result<(), VaultError> {
+        self.wait_for_changes().map(|_| ())
+    }
+
+    pub fn wait_for_changes(&self) -> Result<VaultChanges, VaultError> {
+        let mut paths = BTreeSet::new();
+        let mut rescan = false;
         loop {
             let event = self
                 .events
                 .recv()
                 .map_err(|_| VaultError::WatchDisconnected)??;
-            if self.affects_scan(event) {
+            self.collect(event, &mut paths, &mut rescan);
+            if rescan || !paths.is_empty() {
                 break;
             }
         }
@@ -39,22 +54,36 @@ impl VaultWatch {
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match self.events.recv_timeout(remaining) {
                 Ok(event) => {
-                    event?;
+                    self.collect(event?, &mut paths, &mut rescan);
                 }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return Err(VaultError::WatchDisconnected),
             }
         }
-        Ok(())
+        Ok(VaultChanges {
+            paths: paths.into_iter().collect(),
+            rescan,
+        })
     }
 
-    fn affects_scan(&self, event: Event) -> bool {
-        !matches!(event.kind, EventKind::Access(_))
-            && (event.need_rescan()
-                || event.paths.iter().any(|path| {
-                    path.strip_prefix(&self.root).is_ok_and(|relative| {
-                        relative == Path::new(".obsidianignore") || visible(relative)
-                    })
-                }))
+    fn collect(&self, event: Event, paths: &mut BTreeSet<PathBuf>, rescan: &mut bool) {
+        if matches!(event.kind, EventKind::Access(_)) {
+            return;
+        }
+        *rescan |= event.need_rescan();
+        for path in event.paths {
+            if let Ok(relative) = path.strip_prefix(&self.root) {
+                if relative == Path::new(".obsidianignore") || relative.as_os_str().is_empty() {
+                    *rescan = true;
+                } else if visible(relative) {
+                    paths.insert(relative.into());
+                    *rescan |= matches!(
+                        event.kind,
+                        EventKind::Create(notify::event::CreateKind::Folder)
+                            | EventKind::Remove(notify::event::RemoveKind::Folder)
+                    );
+                }
+            }
+        }
     }
 }

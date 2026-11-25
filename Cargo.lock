@@ -2778,6 +2778,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
+ "walkdir",
  "windows-sys 0.61.2",
 ]
 
@@ -2794,6 +2795,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "walkdir",
+ "windows-sys 0.61.2",
  "yaml_serde",
 ]
 

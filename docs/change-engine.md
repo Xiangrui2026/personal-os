@@ -1,6 +1,6 @@
 # Change Engine 设计
 
-本规范定义独立的 Rust 模块 `pos-change`。AI 维护双链、用户调整目标和后续业务模块的受控操作都可以使用同一套变更协议。首版从单篇 Markdown 中的一处 WikiLink 变更开始，覆盖执行、历史、差异、撤销与中断恢复。
+独立 Rust 模块 `pos-change` 为双链、文档、Markdown 字节范围和 YAML 属性提供受控变更。业务模块通过同一套协议注册操作，复用执行、历史、差异、撤销和恢复。
 
 ## CLI
 
@@ -19,7 +19,9 @@ pos change --root $exampleVault apply undo.json --exclusive
 
 `pos link remove` 接受 `--link '[[目标|别名]]'`。预览在同一文件中找到多个匹配时，可用 `--offset` 指定原文件的 UTF-8 字节位置。现有链接、代码、注释和前置 YAML 不作为新链接的文本候选。撤销记录保留原操作，首版可通过新的正向操作重做。
 
-`pos change recover` 只读列出待处理执行。用 `recover --resolve $changeId --exclusive` 结束匹配操作前哈希的记录。确认操作确实写入了与操作后哈希一致的版本后，追加 `--accept-written` 完成历史。状态冲突时，笔记、已存档的内容和暂存证据都留给用户检查。
+`pos change preview <path> <kind> --payload <JSON> --actor <name>` 生成可应用的载荷。内置操作 `note.create` 接收 Markdown JSON 字符串，`markdown.replace` 接收 `start`、`end`、`text`，`property.set` 接收 `key`、`value`，`property.remove` 接收 `key`。范围以 UTF-8 字节计数，空范围用于插入。
+
+`pos change recover` 只读列出待处理执行。用 `recover --resolve $changeId --exclusive` 结束匹配操作前哈希的记录。确认操作确实写入与操作后哈希一致的版本后，追加 `--accept-written` 完成历史。用 `--keep-current` 结束冲突或归属待确认的执行，保留笔记、冲突证据和版本对象，解除该文件的待处理锁定。
 
 若 SQLite 提示上次中断后需要回滚日志，获准写入 `.maggot` 后可运行 `pos change init` 重新打开版本库。SQLite 完成自身事务恢复后，再检查待处理的 Markdown 变更。
 
@@ -29,14 +31,19 @@ pos change --root $exampleVault apply undo.json --exclusive
 flowchart LR
     Caller["pos CLI · 后续业务模块"] --> Engine["pos-change<br/>计划、执行、撤销、恢复"]
     Engine --> Ops["操作注册表<br/>语义条件与逆操作"]
-    Ops --> Vault["pos-vault<br/>读取、路径定位、WikiLink 字节范围"]
+    Ops --> Vault["pos-vault<br/>身份、字节范围、属性补丁和链接查询"]
+    Vault -->|"只读身份映射"| Store
     Vault --> Markdown["Vault 中的 Markdown"]
     Engine --> Writer["文件写入适配器"]
     Writer --> Markdown
-    Engine --> Store["Vault/.maggot/changes.sqlite<br/>历史、依赖、内容快照"]
+    Engine --> Store["Vault/.maggot/changes.sqlite<br/>历史、依赖、身份、内容对象"]
+    Vault -->|"文件变化"| Observe["外部观察"]
+    Observe --> Store
+    Markdown --> Backup["独立恢复点"]
+    Store --> Backup
 ```
 
-- `pos-vault` 继续负责路径校验和 Markdown 解析。首版按需补充原始文件字节和 WikiLink 字节范围读取，并复用已有路径校验和链接解析。新的读取入口与已有 `read`、`scan` 和监听接口兼容。
+- `pos-vault` 负责路径校验、对象读取、正反向链接查询和最小 YAML 属性补丁。原始文件字节、标题、块与链接使用统一的字节范围。
 - `pos-change` 统筹执行和恢复。操作处理器生成最小补丁和逆操作，文件写入适配器落实经过确认的写入。CLI 和桌面入口复用同一执行接口。
 - 首版用 Rust 类型和进程内注册表按 `(kind, payload_version)` 分发。业务模块可以增加处理器。处理器定义读取和写入范围、前置条件，以及逆补丁或不可逆原因。执行器统一记录和校验这些信息。
 
@@ -51,11 +58,11 @@ flowchart LR
 | 实际效果 | 受影响的资源及范围、实际前后字节的 SHA-256、对应内容对象、重定位上下文和逆操作信息 |
 | 关系 | `depends_on` 指向本次实际依赖的旧 Change，`reverts` 指向本次撤销的原 Change |
 
-`seq` 提供本地提交后的浏览顺序。因果依赖单独记录，以有向无环图表达。新 Change 只引用同一 Vault 内已完成的旧 Change。同一文件中的两处独立补丁可以没有依赖关系。原位置失效时，用范围内容和上下文在当前字节中寻找唯一匹配。
+`seq` 提供本地提交后的浏览顺序。因果依赖单独记录，以有向无环图表达。新 Change 只引用同一 Vault 内已完成的旧 Change。同一文件中的两处独立补丁可以没有依赖关系。位置随已验证的字节变更链移动。外部改写使原位置无法证明时，撤销返回冲突。
 
 处理器声明操作依赖的语义范围。执行器结合历史中仍生效的效果记录确定依赖，并在执行前复核。整篇文件的哈希用于确认预览和写入时的字节一致性，范围用来判断两条 Change 是否互相阻塞。
 
-目标记录库内相对路径和可用的显式笔记 ID。没有显式 ID 的笔记沿用现有路径识别。外部重命名后身份无法确认时报告冲突。将来实现受控重命名时，可以在 Change 中记录旧路径、新路径和对象身份。
+目标记录库内相对路径和逻辑笔记 ID。Vault 识别同卷重命名，Change 完成时把替换后的文件身份绑定到原逻辑 ID。历史按 ID 查找笔记。版本库 v1 会在获准写入时迁移到 v2，既有路径型 ID 的历史仍受原路径约束。
 
 ## 本地存储
 
@@ -79,10 +86,13 @@ flowchart LR
 | `change_dependencies` | 记录 Change 对同一 Vault 已完成旧 Change 的依赖 |
 | `content_blobs` | SHA-256 为键，字节持久化后保持不可变 |
 | `executions` | 按 `change_id` 唯一，保存批准范围、计划效果以及执行和恢复状态 |
+| `execution_conflicts` | 保存结案原因及可读取的现有字节哈希 |
+| `note_bindings` | 将物理文件身份映射到逻辑笔记 ID |
+| `observed_notes` | 保存最近一次捕获的笔记路径、身份与内容哈希 |
 
 ## 执行与中断恢复
 
-首版一个 Change 写一个已存在的 Markdown 文件。所有 Personal OS 写入口共用操作系统管理的 Vault 级文件锁，进程退出时释放。SQLite 事务保护数据库内部一致性，文件与数据库之间通过持久执行记录衔接。 [SQLite 原子提交](https://sqlite.org/atomiccommit.html)
+每个 Change 作用于一个 Markdown 文件，可创建文件、修改已有内容或撤销新建。受控写入口共用操作系统管理的 Vault 级文件锁。SQLite 保护数据库内部一致性，文件与数据库之间通过持久执行记录衔接。 [SQLite 原子提交](https://sqlite.org/atomiccommit.html)
 
 1. **预览**。读取原始字节并校验路径和目标。处理器生成最小补丁、逆操作信息和前后哈希。确认绑定目标文件、具体补丁和输入哈希。初始化 `.maggot` 或执行补丁前，须就真实 Vault 的写入范围征得用户明确同意。
 2. **准备**。获取写锁，重读文件并校验批准时的输入哈希。用 SQLite 事务保存前后字节与 `pending` 记录。每个 `change_id` 只有一份执行记录。
@@ -96,9 +106,9 @@ flowchart LR
 | 匹配操作前哈希 | 结束待处理记录并标为未确认生效，原 Change 留在执行记录中 |
 | 匹配操作后哈希，且用户确认操作后的文件状态来自本次替换 | 追加原 Change，幂等地完成历史 |
 | 匹配操作后哈希，归属仍待确认 | 保留待处理记录和内容，展示当前哈希和暂存证据 |
-| 文件缺失、哈希不同或状态不可核对 | 保存冲突证据，暂停该目标的后续写入 |
+| 不符合预期的文件缺失、哈希不同或状态不可核对 | 暂停该文件的后续写入，待人工确认后可保留当前文件并结案 |
 
-Vault 监听可提示有变化。后续可基于已有可信基线和当前字节追加 `external.observe`，记录捕获到的字节和观察时间。缺少旧字节时，从观察到的新基线开始。
+`pos change observe --actor external` 建立或刷新基线，追加已观察到的外部新增、编辑、重命名和删除。加 `--watch` 可持续观察。受控写入也会记录已有基线与预览之间已经发生的外部变化。历史记录捕获到的状态和观察时间。多次快速外部保存可能被文件通知合并。
 
 ## 条件撤销
 
@@ -106,10 +116,12 @@ Vault 监听可提示有变化。后续可基于已有可信基线和当前字�
 
 例如，`C1` 把第一段的「配位平衡」改成 `[[配位平衡]]`，`C2` 在第二段添加另一条双链。撤销 `C1` 时，在当前文件定位第一段的匹配位置并移除其双链标记，第二段的改动保留。后续 Change 已改动该处链接目标，或当前上下文有多个候选时，预览返回冲突。用户仍可按 Change 查看原始差异和依赖链。
 
-## 首版交付顺序
+## 一致性恢复点
 
-1. 实现 `pos-change` 的核心记录、SQLite 存储，以及 `list`、`show`、`diff` 的只读接口。写入测试使用临时 Vault。
-2. 在 `pos-vault` 补齐原字节与链接范围读取。接入 `link.add`、`link.remove`、预览和单文件写入。执行入口由 `pos change` 和 `pos link` 调用。
-3. 接入条件撤销与重启恢复。验收包括保留独立的后续改动、重复执行的幂等性、编辑冲突时保留现有文件、模拟替换前后中断，以及保留 BOM、换行和原有 Markdown 排版。
+```powershell
+pos backup create --root $exampleVault $archive --exclusive
+pos backup verify $archive
+pos backup restore $archive $newVault
+```
 
-后续通过同一个处理器接口增加 YAML 属性或业务操作。多文件操作需要单独定义写入及恢复协议。跨设备同步可以复用 Vault ID、Change ID、依赖和内容哈希。
+创建时暂停整个 Vault 的外部写入，持有应用锁并比对捕获前后的文件清单。归档包含笔记、附件、配置和 SQLite 一致性副本，跳过 Git 元数据、锁和数据库日志文件。校验验证 SHA-256、SQLite 完整性、外键和历史边界。恢复写到全新目录，保留已纳入版本记录的笔记身份。正式 Vault 启用写入前，应在独立位置完成其实际备份与恢复演练。

@@ -1,8 +1,8 @@
-use crate::{Note, VaultIndex, VaultWatch, note};
+use crate::{Note, VaultIndex, VaultWatch, identity, note};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::Serialize;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -36,6 +36,7 @@ pub enum IssueKind {
     InvalidNote,
     DuplicateId,
     UnresolvedLink,
+    UnresolvedAnchor,
     AmbiguousLink,
 }
 
@@ -57,6 +58,7 @@ pub struct NoteSource {
     pub absolute_path: PathBuf,
     pub metadata: crate::NoteMetadata,
     pub text: String,
+    pub file_key: String,
 }
 
 impl NoteSource {
@@ -67,7 +69,10 @@ impl NoteSource {
                 path: path.clone(),
                 message,
             })?;
-        if edited.metadata.id != self.metadata.id {
+        let declared = |id: &str| id.starts_with("yaml:");
+        if declared(&edited.metadata.id) != declared(&self.metadata.id)
+            || (declared(&edited.metadata.id) && edited.metadata.id != self.metadata.id)
+        {
             return Err(VaultError::InvalidNote {
                 path: path.clone(),
                 message: "the edit changed the note identity".into(),
@@ -103,22 +108,63 @@ impl Vault {
     pub fn read(&self, relative: impl AsRef<Path>) -> Result<Note, VaultError> {
         let relative = relative.as_ref();
         let ignore = self.ignore_rules()?;
-        self.read_note(relative, &ignore)
+        self.read_note(relative, &ignore, &identity::bindings(&self.root)?)
     }
 
     pub fn read_source(&self, relative: impl AsRef<Path>) -> Result<NoteSource, VaultError> {
-        let (absolute_path, text, note) =
-            self.load_note(relative.as_ref(), &self.ignore_rules()?)?;
+        let (absolute_path, text, note, file_key) = self.load_note(
+            relative.as_ref(),
+            &self.ignore_rules()?,
+            &identity::bindings(&self.root)?,
+        )?;
         Ok(NoteSource {
             absolute_path,
             metadata: note.metadata,
             text,
+            file_key,
         })
+    }
+
+    pub fn find_note(&self, id: &str) -> Result<Option<String>, VaultError> {
+        let matches: Vec<_> = self
+            .scan()?
+            .list()?
+            .into_iter()
+            .filter(|note| note.id == id)
+            .map(|note| note.path)
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [path] => Ok(Some(path.clone())),
+            _ => Err(VaultError::InvalidNote {
+                path: matches.join(", "),
+                message: format!("ambiguous note identity {id}"),
+            }),
+        }
+    }
+
+    pub fn file_key(&self, path: &Path) -> Result<String, VaultError> {
+        let path = self.resolve_note_path(path, false)?;
+        let file = fs::File::open(&path).map_err(|source| io_error(&path, source))?;
+        identity::file_key(&file).map_err(|source| io_error(&path, source))
+    }
+
+    pub fn validate_new_note(
+        &self,
+        relative: &Path,
+        text: &str,
+    ) -> Result<(PathBuf, crate::NoteMetadata), VaultError> {
+        let absolute = self.resolve_note_path(relative, true)?;
+        let path = path_key(self.relative(&absolute))
+            .ok_or_else(|| VaultError::InvalidNotePath(relative.into()))?;
+        let note = note::parse(path.clone(), text)
+            .map_err(|message| VaultError::InvalidNote { path, message })?;
+        Ok((absolute, note.metadata))
     }
 
     pub fn scan(&self) -> Result<VaultIndex, VaultError> {
         let ignore = self.ignore_rules()?;
-        VaultIndex::build(self, &ignore)
+        VaultIndex::build(self, &ignore, &identity::bindings(&self.root)?)
     }
 
     pub fn watch(&self) -> Result<VaultWatch, VaultError> {
@@ -150,23 +196,82 @@ impl Vault {
         &self,
         relative: &Path,
         ignore: &Gitignore,
+        bindings: &identity::Bindings,
     ) -> Result<Note, VaultError> {
-        self.load_note(relative, ignore).map(|(_, _, note)| note)
+        self.load_note(relative, ignore, bindings)
+            .map(|(_, _, note, _)| note)
     }
 
     fn load_note(
         &self,
         relative: &Path,
         ignore: &Gitignore,
-    ) -> Result<(PathBuf, String, Note), VaultError> {
+        bindings: &identity::Bindings,
+    ) -> Result<(PathBuf, String, Note, String), VaultError> {
+        let canonical = self.note_path(relative, ignore, false)?;
+        let path = path_key(self.relative(&canonical))
+            .ok_or_else(|| VaultError::InvalidNotePath(relative.into()))?;
+        let mut file = fs::File::open(&canonical).map_err(|source| io_error(&canonical, source))?;
+        let key = identity::file_key(&file).map_err(|source| io_error(&canonical, source))?;
+        let mut source = String::new();
+        file.read_to_string(&mut source)
+            .map_err(|source| io_error(&canonical, source))?;
+        let mut note = note::parse(path.clone(), &source)
+            .map_err(|message| VaultError::InvalidNote { path, message })?;
+        if !note.metadata.id.starts_with("yaml:") {
+            note.metadata.id = bindings
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| format!("file:{key}"));
+        }
+        Ok((canonical, source, note, key))
+    }
+
+    pub fn resolve_note_path(
+        &self,
+        relative: &Path,
+        allow_missing: bool,
+    ) -> Result<PathBuf, VaultError> {
+        self.note_path(relative, &self.ignore_rules()?, allow_missing)
+    }
+
+    fn note_path(
+        &self,
+        relative: &Path,
+        ignore: &Gitignore,
+        allow_missing: bool,
+    ) -> Result<PathBuf, VaultError> {
         if path_key(relative).is_none() || !is_note(relative) || !included(ignore, relative, false)
         {
             return Err(VaultError::InvalidNotePath(relative.into()));
         }
         let mut full = self.root.clone();
-        for component in relative.components() {
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
             full.push(component);
-            let metadata = fs::symlink_metadata(&full).map_err(|source| io_error(&full, source))?;
+            let metadata = match fs::symlink_metadata(&full) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && allow_missing
+                        && components.peek().is_none() =>
+                {
+                    let parent = full
+                        .parent()
+                        .ok_or_else(|| VaultError::InvalidNotePath(relative.into()))?;
+                    let parent =
+                        fs::canonicalize(parent).map_err(|source| io_error(parent, source))?;
+                    if !parent.starts_with(&self.root) {
+                        return Err(VaultError::InvalidNotePath(relative.into()));
+                    }
+                    let candidate = parent.join(component.as_os_str());
+                    if included(ignore, self.relative(&candidate), false) {
+                        return Ok(candidate);
+                    }
+                    return Err(VaultError::InvalidNotePath(relative.into()));
+                }
+                Err(source) => return Err(io_error(&full, source)),
+            };
             if is_link(&metadata) {
                 return Err(VaultError::InvalidNotePath(relative.into()));
             }
@@ -176,16 +281,13 @@ impl Vault {
             return Err(VaultError::InvalidNotePath(relative.into()));
         }
         let actual = self.relative(&canonical);
-        let path = path_key(actual)
+        path_key(actual)
             .filter(|_| is_note(actual) && included(ignore, actual, false))
             .ok_or_else(|| VaultError::InvalidNotePath(relative.into()))?;
-        let source = fs::read_to_string(&canonical).map_err(|source| io_error(&full, source))?;
-        let note = note::parse(path.clone(), &source)
-            .map_err(|message| VaultError::InvalidNote { path, message })?;
-        Ok((canonical, source, note))
+        Ok(canonical)
     }
 
-    fn ignore_rules(&self) -> Result<Gitignore, VaultError> {
+    pub(crate) fn ignore_rules(&self) -> Result<Gitignore, VaultError> {
         let path = self.root.join(".obsidianignore");
         let mut builder = GitignoreBuilder::new(&self.root);
         match fs::symlink_metadata(&path) {
@@ -222,7 +324,7 @@ pub(crate) fn visible(path: &Path) -> bool {
     })
 }
 
-fn included(ignore: &Gitignore, path: &Path, directory: bool) -> bool {
+pub(crate) fn included(ignore: &Gitignore, path: &Path, directory: bool) -> bool {
     visible(path)
         && !ignore
             .matched_path_or_any_parents(path, directory)
@@ -243,7 +345,7 @@ pub(crate) fn is_note(path: &Path) -> bool {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
 }
 
-fn is_link(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_link(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;

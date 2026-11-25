@@ -102,10 +102,8 @@ impl Patch {
         let before = source
             .get(range.clone())
             .ok_or_else(|| invalid("invalid UTF-8 byte range"))?;
-        if before.is_empty() || after.is_empty() || before == after {
-            return Err(invalid(
-                "a change must replace a nonempty span with different text",
-            ));
+        if before == after {
+            return Err(invalid("a patch must change the document"));
         }
         let left = &source[..range.start];
         let right = &source[range.end..];
@@ -144,24 +142,6 @@ impl Patch {
         Ok(edited)
     }
 
-    pub(crate) fn locations(&self, source: &str) -> Vec<Range<usize>> {
-        self.matches(source)
-            .filter(|range| {
-                let left = &source[..range.start];
-                let right = &source[range.end..];
-                (if self.prefix.is_empty() {
-                    left.is_empty()
-                } else {
-                    left.ends_with(&self.prefix)
-                }) && (if self.suffix.is_empty() {
-                    right.is_empty()
-                } else {
-                    right.starts_with(&self.suffix)
-                })
-            })
-            .collect()
-    }
-
     pub(crate) fn matches<'a>(
         &'a self,
         source: &'a str,
@@ -180,9 +160,17 @@ pub struct ChangePlan {
     pub patch: Patch,
     pub before_hash: String,
     pub after_hash: String,
+    #[serde(default = "present")]
+    pub before_exists: bool,
+    #[serde(default = "present")]
+    pub after_exists: bool,
     pub depends_on: Vec<Uuid>,
     pub reverts: Option<Uuid>,
     pub reversible: bool,
+}
+
+fn present() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -206,6 +194,7 @@ pub enum RecoveryStatus {
     AwaitingConfirmation,
     Recovered,
     Conflict,
+    ClosedConflict,
 }
 
 #[derive(Debug, Serialize)]

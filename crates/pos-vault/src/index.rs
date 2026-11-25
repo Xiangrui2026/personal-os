@@ -1,9 +1,25 @@
-use crate::vault::{is_note, path_key};
-use crate::{IssueKind, NoteMetadata, Vault, VaultError, VaultIssue};
+use crate::vault::{included, is_link, is_note, path_key};
+use crate::{IssueKind, NoteMetadata, Vault, VaultChanges, VaultError, VaultIssue, WikiLink};
 use ignore::gitignore::Gitignore;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::path::Path;
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LinkResolution {
+    Resolved { path: String },
+    MissingFile,
+    Ambiguous { paths: Vec<String> },
+    MissingAnchor { path: String, fragment: String },
+}
+
+#[derive(Debug, Serialize)]
+pub struct Backlink {
+    pub source: String,
+    pub link: WikiLink,
+}
 
 #[derive(Debug, Serialize)]
 pub struct VaultStats {
@@ -24,10 +40,15 @@ pub struct ScanReport {
 pub struct VaultIndex {
     db: Connection,
     issues: Vec<VaultIssue>,
+    root: std::path::PathBuf,
 }
 
 impl VaultIndex {
-    pub(crate) fn build(vault: &Vault, ignore: &Gitignore) -> Result<Self, VaultError> {
+    pub(crate) fn build(
+        vault: &Vault,
+        ignore: &Gitignore,
+        bindings: &crate::identity::Bindings,
+    ) -> Result<Self, VaultError> {
         let mut db = Connection::open_in_memory()?;
         db.execute_batch(
             "PRAGMA temp_store = MEMORY;
@@ -84,7 +105,7 @@ impl VaultIndex {
                 if !is_note(relative) {
                     continue;
                 }
-                match vault.read_note(relative, ignore) {
+                match vault.read_note(relative, ignore, bindings) {
                     Ok(note) => {
                         let metadata = serde_json::to_string(&note.metadata)?;
                         insert_note.execute(params![path, note.metadata.id, metadata])?;
@@ -104,7 +125,11 @@ impl VaultIndex {
             }
         }
         transaction.commit()?;
-        Ok(Self { db, issues })
+        Ok(Self {
+            db,
+            issues,
+            root: vault.info().root,
+        })
     }
 
     pub fn list(&self) -> Result<Vec<NoteMetadata>, VaultError> {
@@ -115,6 +140,134 @@ impl VaultIndex {
         encoded
             .map(|value| Ok(serde_json::from_str(&value?)?))
             .collect()
+    }
+
+    pub fn refresh(&mut self, vault: &Vault, changes: &VaultChanges) -> Result<(), VaultError> {
+        let root = vault.info().root;
+        if self.root != root
+            || changes.rescan
+            || changes
+                .paths
+                .iter()
+                .any(|path| path.extension().is_none() || root.join(path).is_dir())
+        {
+            *self = vault.scan()?;
+            return Ok(());
+        }
+        let ignore = vault.ignore_rules()?;
+        let bindings = crate::identity::bindings(&root)?;
+        let mut issues = self.issues.clone();
+        let transaction = self.db.transaction()?;
+        for relative in &changes.paths {
+            let Some(path) = path_key(relative) else {
+                continue;
+            };
+            let key = path.to_lowercase();
+            if cfg!(windows) {
+                transaction.execute(
+                    "DELETE FROM notes WHERE path IN (SELECT path FROM files WHERE path_key = ?1)",
+                    [&key],
+                )?;
+                transaction.execute("DELETE FROM files WHERE path_key = ?1", [&key])?;
+            } else {
+                transaction.execute("DELETE FROM notes WHERE path = ?1", [&path])?;
+                transaction.execute("DELETE FROM files WHERE path = ?1", [&path])?;
+            }
+            issues.retain(|issue| issue.path != path);
+            let full = root.join(relative);
+            if !included(&ignore, relative, false)
+                || !std::fs::symlink_metadata(&full)
+                    .is_ok_and(|meta| meta.is_file() && !is_link(&meta))
+                || std::fs::canonicalize(&full).is_ok_and(|actual| actual != full)
+            {
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO files VALUES (?1, ?2, ?3)",
+                params![path, key, basename(&path).to_lowercase()],
+            )?;
+            if is_note(relative) {
+                match vault.read_note(relative, &ignore, &bindings) {
+                    Ok(note) => {
+                        transaction.execute(
+                            "INSERT INTO notes VALUES (?1, ?2, ?3)",
+                            params![
+                                path,
+                                note.metadata.id,
+                                serde_json::to_string(&note.metadata)?
+                            ],
+                        )?;
+                    }
+                    Err(error) => issues.push(VaultIssue {
+                        kind: if matches!(error, VaultError::InvalidNote { .. }) {
+                            IssueKind::InvalidNote
+                        } else {
+                            IssueKind::UnreadableFile
+                        },
+                        path,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+        }
+        transaction.commit()?;
+        self.issues = issues;
+        Ok(())
+    }
+
+    pub fn resolve(&self, source: &str, link: &WikiLink) -> Result<LinkResolution, VaultError> {
+        let paths = if link.target.is_empty() {
+            self.lookup("path_key", &source.to_lowercase())?
+        } else {
+            self.resolve_link(source, &link.target)?
+        };
+        let path = match paths.as_slice() {
+            [path] => path,
+            [] => return Ok(LinkResolution::MissingFile),
+            _ => return Ok(LinkResolution::Ambiguous { paths }),
+        };
+        if let Some(fragment) = link
+            .fragment
+            .as_ref()
+            .filter(|fragment| !fragment.is_empty())
+            && is_note(Path::new(path))
+        {
+            let text: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT metadata FROM notes WHERE path = ?1",
+                    [path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(text) = text {
+                let note: NoteMetadata = serde_json::from_str(&text)?;
+                if !anchor_exists(&note, fragment) {
+                    return Ok(LinkResolution::MissingAnchor {
+                        path: path.clone(),
+                        fragment: fragment.clone(),
+                    });
+                }
+            }
+        }
+        Ok(LinkResolution::Resolved { path: path.clone() })
+    }
+
+    pub fn backlinks(&self, target: &str) -> Result<Vec<Backlink>, VaultError> {
+        let mut backlinks = Vec::new();
+        for note in self.list()? {
+            for link in note.links {
+                if matches!(self.resolve(&note.path, &link)?,
+                    LinkResolution::Resolved { path } | LinkResolution::MissingAnchor { path, .. } if path == target)
+                {
+                    backlinks.push(Backlink {
+                        source: note.path.clone(),
+                        link,
+                    });
+                }
+            }
+        }
+        Ok(backlinks)
     }
 
     pub fn stats(&self) -> Result<VaultStats, VaultError> {
@@ -157,17 +310,17 @@ impl VaultIndex {
 
         for note in self.list()? {
             for link in &note.links {
-                if link.target.is_empty() {
-                    continue; // Local heading or block reference.
-                }
-                let paths = self.resolve_link(&note.path, &link.target)?;
-                let (kind, message) = match paths.as_slice() {
-                    [] => (
+                let (kind, message) = match self.resolve(&note.path, link)? {
+                    LinkResolution::MissingFile => (
                         IssueKind::UnresolvedLink,
                         format!("no file matches [[{}]]", link.target),
                     ),
-                    [_] => continue,
-                    _ => (
+                    LinkResolution::Resolved { .. } => continue,
+                    LinkResolution::MissingAnchor { path, fragment } => (
+                        IssueKind::UnresolvedAnchor,
+                        format!("no anchor #{fragment} in {path}"),
+                    ),
+                    LinkResolution::Ambiguous { paths } => (
                         IssueKind::AmbiguousLink,
                         format!(
                             "multiple files match [[{}]]: {}",
@@ -236,6 +389,38 @@ impl VaultIndex {
             .query_map(params![path, with_extension], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+fn anchor_exists(note: &NoteMetadata, fragment: &str) -> bool {
+    if let Some(id) = fragment.strip_prefix('^') {
+        return note
+            .blocks
+            .iter()
+            .any(|block| block.id.as_deref() == Some(id));
+    }
+    let parts: Vec<_> = fragment
+        .split('#')
+        .map(|text| text.trim().to_lowercase())
+        .collect();
+    let mut stack = Vec::<(u8, String)>::new();
+    for heading in &note.headings {
+        while stack
+            .last()
+            .is_some_and(|(level, _)| *level >= heading.level)
+        {
+            stack.pop();
+        }
+        stack.push((heading.level, heading.text.to_lowercase()));
+        if stack.len() >= parts.len()
+            && stack[stack.len() - parts.len()..]
+                .iter()
+                .map(|(_, text)| text)
+                .eq(&parts)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn basename(path: &str) -> &str {

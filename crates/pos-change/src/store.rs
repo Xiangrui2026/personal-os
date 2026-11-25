@@ -5,7 +5,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const APPLICATION_ID: i64 = 0x4d414747;
-const FORMAT: i64 = 1;
+const FORMAT: i64 = 2;
+const EXTENSIONS: &str = "
+    CREATE TABLE execution_conflicts (
+        id TEXT PRIMARY KEY REFERENCES executions(id),
+        observed_hash TEXT REFERENCES content_blobs(hash),
+        detail TEXT NOT NULL
+    );
+    CREATE TABLE note_bindings (
+        file_key TEXT PRIMARY KEY,
+        note_id TEXT NOT NULL
+    );
+    CREATE TABLE observed_notes (
+        note_id TEXT PRIMARY KEY,
+        path TEXT NOT NULL,
+        file_key TEXT NOT NULL,
+        hash TEXT NOT NULL REFERENCES content_blobs(hash)
+    );
+    CREATE TABLE observation_state (ready INTEGER PRIMARY KEY CHECK (ready = 1));";
 
 const SCHEMA: &str = "
     CREATE TABLE vault_meta (
@@ -41,7 +58,7 @@ const SCHEMA: &str = "
     CREATE INDEX change_dependent ON change_dependencies(dependency);";
 
 pub(crate) struct Store {
-    db: Connection,
+    pub(crate) db: Connection,
     pub vault_id: Uuid,
 }
 
@@ -55,7 +72,7 @@ impl Store {
                     row.get::<_, i64>(0)
                 })? != 0
             {
-                return Self::checked(db);
+                return Self::checked(db, true);
             }
         }
         let mut db = connect(
@@ -65,6 +82,7 @@ impl Store {
         let vault_id = Uuid::new_v4();
         let transaction = db.transaction()?;
         transaction.execute_batch(SCHEMA)?;
+        transaction.execute_batch(EXTENSIONS)?;
         transaction.execute(
             "INSERT INTO vault_meta VALUES (1, ?1)",
             [vault_id.to_string()],
@@ -84,15 +102,21 @@ impl Store {
         } else {
             OpenFlags::SQLITE_OPEN_READ_ONLY
         };
-        Self::checked(connect(layout, flags)?).map(Some)
+        Self::checked(connect(layout, flags)?, write).map(Some)
     }
 
-    fn checked(db: Connection) -> Result<Self, ChangeError> {
+    fn checked(mut db: Connection, write: bool) -> Result<Self, ChangeError> {
         let format = db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
         let application =
             db.pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))?;
-        if format != FORMAT || application != APPLICATION_ID {
+        if !matches!(format, 1 | FORMAT) || application != APPLICATION_ID {
             return Err(ChangeError::StoreFormat(format));
+        }
+        if format == 1 && write {
+            let migration = db.transaction()?;
+            migration.execute_batch(EXTENSIONS)?;
+            migration.pragma_update(None, "user_version", FORMAT)?;
+            migration.commit()?;
         }
         let id: String = db.query_row(
             "SELECT vault_id FROM vault_meta WHERE singleton = 1",
@@ -167,15 +191,30 @@ impl Store {
             .transpose()
     }
 
-    pub fn active_for(&self, path: &str) -> Result<Vec<ChangePlan>, ChangeError> {
+    pub fn active_for(&self, path: &str, note_id: &str) -> Result<Vec<ChangeRecord>, ChangeError> {
         let mut statement = self.db.prepare(
-            "SELECT e.plan FROM changes c JOIN executions e ON e.id = c.id
-             WHERE c.path = ?1 AND c.reverts IS NULL
+            "SELECT c.seq, c.completed_ms, e.plan FROM changes c JOIN executions e ON e.id = c.id
+             WHERE (json_extract(e.plan, '$.note_id') = ?2 OR c.path = ?1)
+               AND c.reverts IS NULL AND json_extract(e.plan, '$.request.operation.kind') != 'external.observe'
                AND NOT EXISTS (SELECT 1 FROM changes r WHERE r.reverts = c.id)
              ORDER BY c.seq",
         )?;
-        let rows = statement.query_map([path], |row| row.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+        let rows = statement.query_map([path, note_id], record_row)?;
+        rows.map(|row| self.decode_record(row?)).collect()
+    }
+
+    pub fn history_after(
+        &self,
+        sequence: i64,
+        id: &str,
+        current_id: &str,
+    ) -> Result<Vec<ChangeRecord>, ChangeError> {
+        let mut statement = self.db.prepare(
+            "SELECT c.seq, c.completed_ms, e.plan FROM changes c JOIN executions e ON e.id = c.id
+              WHERE c.seq > ?1 AND json_extract(e.plan, '$.note_id') IN (?2, ?3) ORDER BY c.seq",
+        )?;
+        let rows = statement.query_map(params![sequence, id, current_id], record_row)?;
+        rows.map(|row| self.decode_record(row?)).collect()
     }
 
     pub fn check_revert(&self, id: Uuid) -> Result<(), ChangeError> {
@@ -214,6 +253,17 @@ impl Store {
         after: &[u8],
     ) -> Result<(), ChangeError> {
         let transaction = self.db.transaction()?;
+        Self::prepare_in(&transaction, plan, before, after)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_in(
+        transaction: &rusqlite::Transaction<'_>,
+        plan: &ChangePlan,
+        before: &[u8],
+        after: &[u8],
+    ) -> Result<(), ChangeError> {
         for (digest, bytes) in [(&plan.before_hash, before), (&plan.after_hash, after)] {
             transaction.execute(
                 "INSERT OR IGNORE INTO content_blobs VALUES (?1, ?2)",
@@ -238,18 +288,33 @@ impl Store {
                 serde_json::to_string(plan)?
             ],
         )?;
-        transaction.commit()?;
         Ok(())
     }
 
-    pub fn finish(&mut self, plan: &ChangePlan) -> Result<ChangeRecord, ChangeError> {
+    pub fn finish(
+        &mut self,
+        plan: &ChangePlan,
+        file_key: Option<&str>,
+    ) -> Result<ChangeRecord, ChangeError> {
+        let vault_id = self.vault_id;
+        let transaction = self.db.transaction()?;
+        let record = Self::finish_in(&transaction, vault_id, plan, file_key)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub(crate) fn finish_in(
+        transaction: &rusqlite::Transaction<'_>,
+        vault_id: Uuid,
+        plan: &ChangePlan,
+        file_key: Option<&str>,
+    ) -> Result<ChangeRecord, ChangeError> {
         let id = plan.request.change_id.to_string();
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let time = i64::try_from(time).unwrap_or(i64::MAX);
-        let transaction = self.db.transaction()?;
         if transaction.execute(
             "UPDATE executions SET state = 'completed' WHERE id = ?1 AND state = 'pending'",
             [&id],
@@ -275,13 +340,42 @@ impl Store {
                 params![id, dependency.to_string()],
             )?;
         }
-        transaction.commit()?;
+        if let Some(key) = file_key.filter(|_| plan.after_exists) {
+            Self::baseline(
+                transaction,
+                &plan.note_id,
+                &plan.request.path,
+                key,
+                &plan.after_hash,
+            )?;
+        } else if !plan.after_exists {
+            transaction.execute(
+                "DELETE FROM observed_notes WHERE note_id = ?1",
+                [&plan.note_id],
+            )?;
+        }
         Ok(ChangeRecord {
             seq,
-            vault_id: self.vault_id,
+            vault_id,
             executed_unix_ms: time,
             plan: plan.clone(),
         })
+    }
+
+    pub(crate) fn baseline(
+        transaction: &rusqlite::Transaction<'_>,
+        id: &str,
+        path: &str,
+        key: &str,
+        digest: &str,
+    ) -> Result<(), ChangeError> {
+        if !id.starts_with("yaml:") {
+            transaction.execute("INSERT INTO note_bindings VALUES (?1, ?2) ON CONFLICT(file_key) DO UPDATE SET note_id = excluded.note_id", params![key, id])?;
+        }
+        transaction.execute("INSERT INTO observed_notes VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(note_id) DO UPDATE SET path = excluded.path, file_key = excluded.file_key, hash = excluded.hash",
+            params![id, path, key, digest])?;
+        Ok(())
     }
 
     pub fn mark_not_applied(&self, id: Uuid) -> Result<(), ChangeError> {
@@ -297,8 +391,52 @@ impl Store {
         Ok(())
     }
 
+    pub fn close_conflict(
+        &mut self,
+        id: Uuid,
+        observed: Option<&[u8]>,
+        detail: &str,
+    ) -> Result<(), ChangeError> {
+        let id = id.to_string();
+        let transaction = self.db.transaction()?;
+        let digest = observed.map(hash);
+        if let Some((digest, bytes)) = digest.as_ref().zip(observed) {
+            transaction.execute(
+                "INSERT OR IGNORE INTO content_blobs VALUES (?1, ?2)",
+                params![digest, bytes],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO execution_conflicts VALUES (?1, ?2, ?3)",
+            params![id, digest, detail],
+        )?;
+        if transaction.execute(
+            "UPDATE executions SET state = 'not_applied' WHERE id = ?1 AND state = 'pending'",
+            [&id],
+        )? != 1
+        {
+            return Err(ChangeError::Corrupt(format!(
+                "execution {id} was not pending"
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn conflict_closed(&self, id: Uuid) -> Result<bool, ChangeError> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM execution_conflicts WHERE id = ?1)",
+            [id.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn blob(&self, digest: &str) -> Result<String, ChangeError> {
-        let bytes: Vec<u8> = self.db.query_row(
+        Self::blob_in(&self.db, digest)
+    }
+
+    pub(crate) fn blob_in(db: &Connection, digest: &str) -> Result<String, ChangeError> {
+        let bytes: Vec<u8> = db.query_row(
             "SELECT bytes FROM content_blobs WHERE hash = ?1",
             [digest],
             |row| row.get(0),

@@ -1,6 +1,51 @@
 use pos_vault::{IssueKind, Vault, VaultError};
 use std::{fs, path::Path};
 
+#[test]
+fn resolves_anchors_and_backlinks_and_refreshes_changed_paths() {
+    let root = tempfile::tempdir().unwrap();
+    put(
+        root.path(),
+        "A.md",
+        "# Parent\n## Child\n\nBlock ^destination\n",
+    );
+    put(
+        root.path(),
+        "B.md",
+        "[[A#Parent#Child]] [[A#^destination]] [[A#Missing]]",
+    );
+    let vault = Vault::open(root.path()).unwrap();
+    let mut index = vault.scan().unwrap();
+    assert_eq!(index.backlinks("A.md").unwrap().len(), 3);
+    assert_eq!(
+        index
+            .validate()
+            .unwrap()
+            .iter()
+            .map(|issue| issue.kind)
+            .collect::<Vec<_>>(),
+        [IssueKind::UnresolvedAnchor]
+    );
+    let before = vault.read("A.md").unwrap().metadata.id;
+    fs::rename(root.path().join("A.md"), root.path().join("C.md")).unwrap();
+    put(root.path(), "B.md", "[[C#Child]]");
+    index
+        .refresh(
+            &vault,
+            &pos_vault::VaultChanges {
+                paths: ["A.md", "B.md", "C.md"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                rescan: false,
+            },
+        )
+        .unwrap();
+    assert!(index.validate().unwrap().is_empty());
+    assert_eq!(index.backlinks("C.md").unwrap().len(), 1);
+    assert_eq!(vault.read("C.md").unwrap().metadata.id, before);
+}
+
 fn put(root: &Path, relative: &str, content: impl AsRef<[u8]>) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -82,7 +127,7 @@ fn indexes_included_files_and_reports_distinct_validation_problems() {
             "---\nid: 42\n---\n",
             "[[Existing]] [[./Existing]] [[Library/Existing]] [[Library/Existing.md]] ",
             "[[../Research/Ambiguous]] [[/Research/Ambiguous]] ![[图.png]] ",
-            "[[Ambiguous]] [[Missing]] [[#标题]]",
+            "[[Ambiguous]] [[Missing]] [[#标题]]\n\n# 标题\n",
         ),
     );
     put(root, "Library/Existing.md", "---\nid: '42'\n---\n");
@@ -134,9 +179,13 @@ fn indexes_included_files_and_reports_distinct_validation_problems() {
         1
     );
     assert_eq!(issues.len(), 6);
-    assert_eq!(
-        vault.read("Journal/Ambiguous.md").unwrap().metadata.id,
-        "path:Journal/Ambiguous.md"
+    assert!(
+        vault
+            .read("Journal/Ambiguous.md")
+            .unwrap()
+            .metadata
+            .id
+            .starts_with("file:")
     );
     assert_eq!(
         vault.read("Library/Source.md").unwrap().metadata.id,

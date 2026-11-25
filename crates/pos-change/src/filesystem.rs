@@ -66,13 +66,7 @@ impl Layout {
         if regular(&backup, false)? {
             return Err(conflict("a backup already exists for this execution"));
         }
-        let mut next = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&pending)?;
-        next.write_all(after)?;
-        next.sync_all()?;
-        drop(next);
+        stage(&pending, after)?;
 
         let mut guard = note_guard(target)?;
         let mut guarded = Vec::new();
@@ -85,6 +79,38 @@ impl Layout {
         if actual_backup != before_hash || read_hash(target)? != hash(after) {
             return Err(conflict(
                 "replacement verification failed; preimage kept in staging",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn create(&self, id: Uuid, target: &Path, after: &[u8]) -> Result<(), ChangeError> {
+        let (pending, _) = self.artifacts(id);
+        stage(&pending, after)?;
+        fs::hard_link(&pending, target)?;
+        if read_hash(target)? != hash(after) {
+            return Err(conflict(
+                "the created note no longer matches the approved bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn delete(&self, id: Uuid, target: &Path, before_hash: &str) -> Result<(), ChangeError> {
+        let (_, backup) = self.artifacts(id);
+        if regular(&backup, false)? {
+            return Err(conflict("a backup already exists for this execution"));
+        }
+        let mut guard = note_guard(target)?;
+        let mut guarded = Vec::new();
+        guard.read_to_end(&mut guarded)?;
+        if hash(&guarded) != before_hash || read_hash(target)? != before_hash {
+            return Err(conflict("the note changed before deletion"));
+        }
+        fs::rename(target, &backup)?;
+        if read_hash(&backup)? != before_hash || target.exists() {
+            return Err(conflict(
+                "deletion verification failed; preimage kept in staging",
             ));
         }
         Ok(())
@@ -131,7 +157,7 @@ fn ensure_directory(path: &Path) -> Result<(), ChangeError> {
     Ok(())
 }
 
-fn regular(path: &Path, directory: bool) -> Result<bool, ChangeError> {
+pub(crate) fn regular(path: &Path, directory: bool) -> Result<bool, ChangeError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
@@ -155,6 +181,13 @@ fn regular(path: &Path, directory: bool) -> Result<bool, ChangeError> {
         return Err(ChangeError::UnsafePath(path.into()));
     }
     Ok(true)
+}
+
+fn stage(path: &Path, bytes: &[u8]) -> Result<(), ChangeError> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn read_hash(path: &Path) -> Result<String, ChangeError> {
