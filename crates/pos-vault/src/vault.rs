@@ -52,6 +52,31 @@ pub struct VaultInfo {
     pub obsidian_config: bool,
 }
 
+#[derive(Debug)]
+pub struct NoteSource {
+    pub absolute_path: PathBuf,
+    pub metadata: crate::NoteMetadata,
+    pub text: String,
+}
+
+impl NoteSource {
+    pub fn validate_edit(&self, text: &str) -> Result<(), VaultError> {
+        let path = &self.metadata.path;
+        let edited =
+            note::parse(path.clone(), text).map_err(|message| VaultError::InvalidNote {
+                path: path.clone(),
+                message,
+            })?;
+        if edited.metadata.id != self.metadata.id {
+            return Err(VaultError::InvalidNote {
+                path: path.clone(),
+                message: "the edit changed the note identity".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// An Obsidian vault with no filesystem write operations.
 pub struct Vault {
     root: PathBuf,
@@ -78,11 +103,17 @@ impl Vault {
     pub fn read(&self, relative: impl AsRef<Path>) -> Result<Note, VaultError> {
         let relative = relative.as_ref();
         let ignore = self.ignore_rules()?;
-        if path_key(relative).is_none() || !is_note(relative) || !included(&ignore, relative, false)
-        {
-            return Err(VaultError::InvalidNotePath(relative.into()));
-        }
         self.read_note(relative, &ignore)
+    }
+
+    pub fn read_source(&self, relative: impl AsRef<Path>) -> Result<NoteSource, VaultError> {
+        let (absolute_path, text, note) =
+            self.load_note(relative.as_ref(), &self.ignore_rules()?)?;
+        Ok(NoteSource {
+            absolute_path,
+            metadata: note.metadata,
+            text,
+        })
     }
 
     pub fn scan(&self) -> Result<VaultIndex, VaultError> {
@@ -120,6 +151,18 @@ impl Vault {
         relative: &Path,
         ignore: &Gitignore,
     ) -> Result<Note, VaultError> {
+        self.load_note(relative, ignore).map(|(_, _, note)| note)
+    }
+
+    fn load_note(
+        &self,
+        relative: &Path,
+        ignore: &Gitignore,
+    ) -> Result<(PathBuf, String, Note), VaultError> {
+        if path_key(relative).is_none() || !is_note(relative) || !included(ignore, relative, false)
+        {
+            return Err(VaultError::InvalidNotePath(relative.into()));
+        }
         let mut full = self.root.clone();
         for component in relative.components() {
             full.push(component);
@@ -137,8 +180,9 @@ impl Vault {
             .filter(|_| is_note(actual) && included(ignore, actual, false))
             .ok_or_else(|| VaultError::InvalidNotePath(relative.into()))?;
         let source = fs::read_to_string(&canonical).map_err(|source| io_error(&full, source))?;
-        note::parse(path.clone(), &source)
-            .map_err(|message| VaultError::InvalidNote { path, message })
+        let note = note::parse(path.clone(), &source)
+            .map_err(|message| VaultError::InvalidNote { path, message })?;
+        Ok((canonical, source, note))
     }
 
     fn ignore_rules(&self) -> Result<Gitignore, VaultError> {

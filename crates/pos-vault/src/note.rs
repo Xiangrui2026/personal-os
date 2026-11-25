@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::ops::Range;
@@ -10,6 +10,39 @@ pub struct WikiLink {
     pub fragment: Option<String>,
     pub label: Option<String>,
     pub embed: bool,
+}
+
+#[derive(Debug)]
+pub struct LocatedWikiLink {
+    pub range: Range<usize>,
+    pub link: WikiLink,
+}
+
+/// Byte ranges measured in the original UTF-8 file, including any BOM.
+#[derive(Debug)]
+pub struct NoteMarkup {
+    pub links: Vec<LocatedWikiLink>,
+    text: Vec<Range<usize>>,
+    comments: Vec<Range<usize>>,
+}
+
+impl NoteMarkup {
+    pub fn is_plain_text(&self, range: &Range<usize>) -> bool {
+        !range.is_empty()
+            && self
+                .text
+                .iter()
+                .any(|text| text.start <= range.start && range.end <= text.end)
+            && !self
+                .comments
+                .iter()
+                .any(|comment| comment.start < range.end && range.start < comment.end)
+    }
+}
+
+pub fn inspect_markdown(source: &str) -> Result<NoteMarkup, String> {
+    let (_, body) = split_frontmatter(source)?;
+    Ok(markup(body, source.len() - body.len(), true))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -60,7 +93,11 @@ pub(crate) fn parse(path: String, source: &str) -> Result<Note, String> {
             id,
             tags,
             aliases,
-            links: wiki_links(body),
+            links: markup(body, 0, false)
+                .links
+                .into_iter()
+                .map(|located| located.link)
+                .collect(),
         },
         frontmatter,
         body: body.to_owned(),
@@ -108,11 +145,25 @@ fn split_frontmatter(source: &str) -> Result<(Map<String, Value>, &str), String>
     Ok((Map::new(), source))
 }
 
-fn wiki_links(body: &str) -> Vec<WikiLink> {
+fn markup(body: &str, offset: usize, locate_text: bool) -> NoteMarkup {
     let mut links = Vec::new();
     let mut literal = Vec::new();
+    let mut text = Vec::new();
+    let mut nested = 0usize;
     let options = Options::ENABLE_WIKILINKS | Options::ENABLE_MATH;
     for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
+        if locate_text {
+            match &event {
+                Event::Start(Tag::Link { .. } | Tag::Image { .. } | Tag::CodeBlock(_)) => {
+                    nested += 1
+                }
+                Event::End(TagEnd::Link | TagEnd::Image | TagEnd::CodeBlock) => nested -= 1,
+                Event::Text(_) if nested == 0 => {
+                    text.push(range.start + offset..range.end + offset)
+                }
+                _ => {}
+            }
+        }
         let embed = match event {
             Event::Start(Tag::Link {
                 link_type: LinkType::WikiLink { .. },
@@ -150,29 +201,39 @@ fn wiki_links(body: &str) -> Vec<WikiLink> {
             None => (destination, None),
         };
         if !target.trim().is_empty() || fragment.as_ref().is_some_and(|value| !value.is_empty()) {
-            links.push((
-                range.start,
-                WikiLink {
+            links.push(LocatedWikiLink {
+                range: range.start + offset..range.end + offset,
+                link: WikiLink {
                     target: target.trim().to_owned(),
                     fragment,
                     label,
                     embed,
                 },
-            ));
+            });
         }
     }
 
-    let comments = comment_ranges(body, &literal);
-    let mut comments = comments.into_iter().peekable();
-    links
+    let comments: Vec<_> = comment_ranges(body, &literal)
         .into_iter()
-        .filter_map(|(offset, link)| {
-            while comments.peek().is_some_and(|range| range.end <= offset) {
-                comments.next();
-            }
-            (!comments.peek().is_some_and(|range| range.contains(&offset))).then_some(link)
-        })
-        .collect()
+        .map(|range| range.start + offset..range.end + offset)
+        .collect();
+    let mut pending = comments.iter().peekable();
+    links.retain(|link| {
+        while pending
+            .peek()
+            .is_some_and(|range| range.end <= link.range.start)
+        {
+            pending.next();
+        }
+        !pending
+            .peek()
+            .is_some_and(|range| range.start < link.range.end)
+    });
+    NoteMarkup {
+        links,
+        text,
+        comments,
+    }
 }
 
 fn comment_ranges(text: &str, literal: &[Range<usize>]) -> Vec<Range<usize>> {

@@ -2,6 +2,27 @@
 
 本规范定义独立的 Rust 模块 `pos-change`。AI 维护双链、用户调整目标和后续业务模块的受控操作都可以使用同一套变更协议。首版从单篇 Markdown 中的一处 WikiLink 变更开始，覆盖执行、历史、差异、撤销与中断恢复。
 
+## CLI
+
+以下命令使用已有示例笔记的测试 Vault。初始化后生成 JSON 预览，检查其中的补丁、目标和哈希，然后应用同一份预览文件。`--exclusive` 表示调用者已暂停会修改目标文件的编辑器和同步进程。
+
+```powershell
+pos change --root $exampleVault init
+pos link --root $exampleVault add '笔记.md' --text '配位平衡' --target '配位平衡' --actor 'local' > add.json
+pos change --root $exampleVault apply add.json --exclusive
+pos change --root $exampleVault list
+pos change --root $exampleVault show $changeId
+pos change --root $exampleVault diff $changeId
+pos change --root $exampleVault undo $changeId --actor 'local' > undo.json
+pos change --root $exampleVault apply undo.json --exclusive
+```
+
+`pos link remove` 接受 `--link '[[目标|别名]]'`。预览在同一文件中找到多个匹配时，可用 `--offset` 指定原文件的 UTF-8 字节位置。现有链接、代码、注释和前置 YAML 不作为新链接的文本候选。撤销记录保留原操作，首版可通过新的正向操作重做。
+
+`pos change recover` 只读列出待处理执行。用 `recover --resolve $changeId --exclusive` 结束匹配操作前哈希的记录。确认操作确实写入了与操作后哈希一致的版本后，追加 `--accept-written` 完成历史。状态冲突时，笔记、已存档的内容和暂存证据都留给用户检查。
+
+若 SQLite 提示上次中断后需要回滚日志，获准写入 `.maggot` 后可运行 `pos change init` 重新打开版本库。SQLite 完成自身事务恢复后，再检查待处理的 Markdown 变更。
+
 ## 模块边界
 
 ```mermaid
@@ -73,8 +94,8 @@ flowchart LR
 | 当前状态 | 处理 |
 | --- | --- |
 | 匹配操作前哈希 | 结束待处理记录并标为未确认生效，原 Change 留在执行记录中 |
-| 匹配操作后哈希，且能确认操作后的文件状态来自本次替换 | 追加原 Change，幂等地完成历史 |
-| 匹配操作后哈希，期间的外部写入无法排除 | 保留待处理记录和内容，展示证据供用户确认归属 |
+| 匹配操作后哈希，且用户确认操作后的文件状态来自本次替换 | 追加原 Change，幂等地完成历史 |
+| 匹配操作后哈希，归属仍待确认 | 保留待处理记录和内容，展示当前哈希和暂存证据 |
 | 文件缺失、哈希不同或状态不可核对 | 保存冲突证据，暂停该目标的后续写入 |
 
 Vault 监听可提示有变化。后续可基于已有可信基线和当前字节追加 `external.observe`，记录捕获到的字节和观察时间。缺少旧字节时，从观察到的新基线开始。

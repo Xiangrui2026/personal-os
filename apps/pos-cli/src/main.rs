@@ -1,3 +1,6 @@
+mod change;
+
+use change::{ChangeAction, LinkAction};
 use clap::{Parser, Subcommand};
 use pos_vault::Vault;
 use serde::Serialize;
@@ -22,6 +25,20 @@ enum Command {
         root: PathBuf,
         #[command(subcommand)]
         action: VaultAction,
+    },
+    /// Preview, apply, or inspect versioned changes.
+    Change {
+        #[arg(long, value_name = "DIRECTORY")]
+        root: PathBuf,
+        #[command(subcommand)]
+        action: ChangeAction,
+    },
+    /// Preview a single WikiLink edit.
+    Link {
+        #[arg(long, value_name = "DIRECTORY")]
+        root: PathBuf,
+        #[command(subcommand)]
+        action: LinkAction,
     },
 }
 
@@ -54,7 +71,14 @@ fn emit(value: &impl Serialize) -> Result<(), Box<dyn Error>> {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
-    let Command::Vault { root, action } = cli.command;
+    match cli.command {
+        Command::Vault { root, action } => run_vault(root, action),
+        Command::Change { root, action } => change::run(root, action),
+        Command::Link { root, action } => change::link(root, action),
+    }
+}
+
+fn run_vault(root: PathBuf, action: VaultAction) -> Result<(), Box<dyn Error>> {
     let vault = Vault::open(root)?;
 
     match action {
