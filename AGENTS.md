@@ -19,3 +19,7 @@
 ## 修改真实 Vault 前先询问
 
 真实 Obsidian Vault 默认只读。任何新增、修改、移动或删除都需要先说明范围并取得用户明确同意。需要写入的开发和测试使用独立的临时 Vault。
+
+## 本地数据优先使用 Obsidian Markdown
+
+笔记、日志、目标和计划等适合用 Markdown 和 YAML 属性表达的数据，以 Obsidian Vault 为主存储。只有明确需要持久化结构化数据时，才在 Vault 之外使用独立的 SQLite 文件。由 Markdown 可重建的索引优先保存在内存中。
