@@ -58,6 +58,10 @@ fn task_fields(project: Option<Uuid>, depends_on: Vec<Uuid>) -> Fields {
         initial_estimate_minutes: Some(70),
         estimate_minutes: None,
         category: None,
+        importance: None,
+        checkpoints: Vec::new(),
+        outcome: None,
+        exclude_from_estimates: false,
     }
 }
 
@@ -69,6 +73,184 @@ fn note_count(root: &Path) -> usize {
         .stats()
         .unwrap()
         .notes
+}
+
+#[test]
+fn board_keeps_checkpoints_time_and_original_arrangements_separate() {
+    let (_directory, service) = fixture();
+    let date = "2025-11-26".parse().unwrap();
+    let time = |clock_text: &str| clock(&format!("2025-11-26T{clock_text}:00+08:00"));
+    let interval = |start, end| Interval {
+        start: time(start),
+        end: time(end),
+    };
+    let task = create(
+        &service,
+        "Proof",
+        serde_json::from_value(serde_json::json!({
+            "type":"task", "importance":85, "initial_estimate_minutes":60, "due_at":time("12:00"),
+            "checkpoints":[{"title":"Outline"},{"title":"Verify"}]
+        }))
+        .unwrap(),
+    );
+    create(
+        &service,
+        "Plan",
+        Fields::DailyPlan {
+            date,
+            tasks: vec![task],
+            priority_tasks: vec![task],
+            focus_goals: Vec::new(),
+            budget_minutes: None,
+            buffer_minutes: 10,
+            work_windows: Some(vec![interval("09:00", "12:00"), interval("13:00", "14:00")]),
+            strategic_minutes: Some(40),
+            importance_threshold: None,
+            urgency_percent: None,
+            closing: None,
+        },
+    );
+    let event = create(
+        &service,
+        "Meeting",
+        Fields::Event {
+            interval: interval("10:30", "11:00"),
+        },
+    );
+    submit(
+        &service,
+        Action::Edit {
+            id: event,
+            item: Item {
+                title: "Meeting".into(),
+                fields: Fields::Event {
+                    interval: interval("10:45", "11:15"),
+                },
+            },
+        },
+        at(),
+    );
+    create(
+        &service,
+        "Proof block",
+        Fields::TimeBlock {
+            task,
+            interval: interval("11:15", "11:45"),
+        },
+    );
+    for (start, end) in [("09:00", "09:30"), ("09:20", "09:40")] {
+        create(
+            &service,
+            "Proof log",
+            Fields::TimeEntry {
+                task,
+                intervals: vec![interval(start, end)],
+                status: EntryStatus::Finished,
+                running_since: None,
+            },
+        );
+    }
+    submit(
+        &service,
+        Action::SetCheckpoint {
+            id: task,
+            title: "Outline".into(),
+            done: true,
+        },
+        at(),
+    );
+    let mut item = service.catalog().unwrap().get(task).unwrap().item.clone();
+    if let Fields::Task {
+        estimate_minutes, ..
+    } = &mut item.fields
+    {
+        *estimate_minutes = Some(90);
+    }
+    let revision = service
+        .preview(
+            Action::Edit { id: task, item },
+            "fixture",
+            Some("harder proof".into()),
+            at(),
+        )
+        .unwrap();
+    service
+        .apply(&revision, &ExclusiveWrite::confirmed())
+        .unwrap();
+    let board = service.day(date, "Asia/Shanghai", at()).unwrap();
+    assert_eq!(
+        board.initial.as_ref().unwrap().scheduled[0].interval,
+        interval("10:30", "11:00")
+    );
+    assert_eq!(board.scheduled[0].interval, interval("10:45", "11:15"));
+    assert_eq!(board.totals.actual_seconds, 40 * 60);
+    assert_eq!(board.planning.distribution[0].seconds, 40 * 60);
+    assert_eq!(board.planning.remaining_work_minutes, Some(140.0));
+    assert_eq!(board.planning.priorities[0].available_minutes, Some(80.0));
+    assert_eq!(board.planning.priorities[0].pressure, Some(50.0 / 80.0));
+    assert_eq!(board.planning.priorities[0].quadrant, Some(2));
+    assert_eq!(board.planning.strategic_scheduled_minutes, 30.0);
+    assert_eq!(board.estimate_revisions[0].before, Some(60));
+    assert_eq!(board.estimate_revisions[0].after, Some(90));
+    assert_eq!(
+        board.estimate_revisions[0].reason.as_deref(),
+        Some("harder proof")
+    );
+    assert!(
+        matches!(&board.tasks[0].task.item.fields, Fields::Task { checkpoints, .. }
+        if checkpoints[0].done && !checkpoints[1].done)
+    );
+}
+
+#[test]
+fn calibration_requires_comparable_completed_tasks_and_reports_sample_limits() {
+    let (_directory, service) = fixture();
+    let date = "2025-11-26".parse().unwrap();
+    for index in 0..7 {
+        let excluded = index == 5;
+        let status = if index == 6 { "doing" } else { "done" };
+        let task = create(
+            &service,
+            &format!("Study {index}"),
+            serde_json::from_value(serde_json::json!({
+                "type":"task", "status":status, "category":"study", "initial_estimate_minutes":30,
+                "exclude_from_estimates":excluded
+            }))
+            .unwrap(),
+        );
+        create(
+            &service,
+            &format!("Log {index}"),
+            Fields::TimeEntry {
+                task,
+                intervals: vec![Interval {
+                    start: clock("2025-11-25T13:00:00+08:00"),
+                    end: clock("2025-11-25T14:00:00+08:00"),
+                }],
+                status: EntryStatus::Finished,
+                running_since: None,
+            },
+        );
+        if index == 6 {
+            submit(
+                &service,
+                Action::ScheduleTask {
+                    date,
+                    task,
+                    priority: false,
+                },
+                at(),
+            );
+        }
+    }
+    let board = service.day(date, "Asia/Shanghai", at()).unwrap();
+    let estimate = &board.planning.estimates["study"];
+    assert_eq!(estimate.count, 5);
+    assert_eq!(estimate.p50, Some(2.0));
+    assert_eq!(estimate.p80, None);
+    assert_eq!(estimate.p95, None);
+    assert_eq!(board.planning.remaining_work_minutes, None);
+    assert_eq!(board.planning.priorities[0].quadrant, None);
 }
 
 #[test]
@@ -89,6 +271,7 @@ fn roadmap_day_and_carry_over_reference_one_task() {
             sequence: 2,
             status: WorkStatus::Doing,
             exit_criteria: vec!["Draft".into()],
+            due_at: None,
         },
     );
     let project = create(

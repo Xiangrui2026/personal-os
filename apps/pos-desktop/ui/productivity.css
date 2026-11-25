@@ -1,4 +1,4 @@
-.pos-content, .pos-column { display: grid; gap: 14px; }
+.pos-content { display: grid; gap: 14px; }
 .pos-content h2, .pos-dialog h2 { margin: 0 0 10px; font-size: 1.12rem; }
 .pos-connect, .pos-toolbar, .pos-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .pos-connect { align-items: end; margin: 0 0 12px; }
@@ -21,19 +21,13 @@
 .pos-error { color: #a03138; font-size: .88rem; overflow-wrap: anywhere; }
 .pos-error:empty { display: none; }
 .pos-muted { color: #607165; font-size: .85rem; margin: 6px 0; }
-.pos-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-.pos-metric, .pos-panel { border: 1px solid #dbe3dc; border-radius: 10px; background: #fff; padding: 13px; min-width: 0; }
-.pos-metric span { display: block; color: #607165; font-size: .8rem; }
-.pos-metric strong { display: block; margin-top: 4px; font-size: 1.25rem; }
-.pos-day { display: grid; gap: 12px; grid-template-columns: minmax(155px, .85fr) minmax(235px, 1.7fr) minmax(180px, 1fr); align-items: start; }
+.pos-panel { border: 1px solid #dbe3dc; border-radius: 10px; background: #fff; padding: 13px; min-width: 0; }
 .pos-list { list-style: none; margin: 0; padding: 0; }
 .pos-list > li { padding: 6px 0; overflow-wrap: anywhere; }
 .pos-list > li + li { border-top: 1px solid #ecf1ec; }
 .pos-row { display: flex; align-items: start; justify-content: space-between; flex-wrap: wrap; gap: 7px; }
 .pos-row strong { overflow-wrap: anywhere; font-size: .9rem; }
 .pos-row p { margin: 3px 0 0; color: #607165; font-size: .8rem; }
-.pos-lane { border-top: 1px solid #ecf1ec; padding: 8px 0 4px; }
-.pos-lane h3 { margin: 0 0 5px; font-size: .85rem; color: #567160; }
 .pos-focus { display: grid; gap: 6px; }
 .pos-timer { font-size: 1.55rem; font-variant-numeric: tabular-nums; }
 .pos-dialog { width: min(580px, 94vw); max-height: 86vh; padding: 18px; margin: auto; overflow: auto;
@@ -49,11 +43,3 @@
   font-size: .78rem; background: #f6e9e8; border-radius: 7px;
 }
 .pos-diff pre + pre { background: #e6f1e9; }
-@media (max-width: 1050px) {
-  .pos-day { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .pos-day > :last-child { grid-column: 1 / -1; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (max-width: 780px) {
-  .pos-day, .pos-day > :last-child { grid-template-columns: minmax(0, 1fr); }
-  .pos-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}

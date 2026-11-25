@@ -181,8 +181,32 @@ impl Catalog {
                 depends_on,
                 initial_estimate_minutes,
                 estimate_minutes,
+                importance,
+                checkpoints,
                 ..
             } => {
+                let mut titles = BTreeSet::new();
+                if importance.is_some_and(|value| value > 100)
+                    || checkpoints.iter().any(|item| {
+                        item.title.trim().is_empty()
+                            || item.title.trim() != item.title
+                            || !titles.insert(&item.title)
+                    })
+                {
+                    return Err(invalid(
+                        "importance must be 0–100 and checkpoint titles must be distinct and trimmed",
+                    ));
+                }
+                if let Some(Fields::Task {
+                    initial_estimate_minutes: Some(initial),
+                    ..
+                }) = existing.map(|old| &old.item.fields)
+                    && *initial_estimate_minutes != Some(*initial)
+                {
+                    return Err(invalid(
+                        "the initial estimate is fixed after it is first recorded",
+                    ));
+                }
                 if let Some(id) = project {
                     self.require(*id, "project")?;
                 }
@@ -224,6 +248,10 @@ impl Catalog {
                 focus_goals,
                 budget_minutes,
                 buffer_minutes,
+                work_windows,
+                strategic_minutes,
+                importance_threshold,
+                urgency_percent,
                 closing,
             } => {
                 if self.plan(*date)?.is_some_and(|plan| plan.id != entity.id)
@@ -241,6 +269,31 @@ impl Catalog {
                 }
                 if budget_minutes.is_some_and(|budget| *buffer_minutes > budget) {
                     return Err(invalid("buffer exceeds the time budget"));
+                }
+                if let Some(windows) = work_windows {
+                    let mut windows = windows.clone();
+                    windows.sort_by_key(|window| window.start);
+                    for window in &windows {
+                        interval_valid(*window)?;
+                    }
+                    if windows.windows(2).any(|pair| pair[0].end > pair[1].start) {
+                        return Err(invalid("work windows must not overlap"));
+                    }
+                }
+                if budget_minutes
+                    .zip(*strategic_minutes)
+                    .is_some_and(|(budget, strategic)| {
+                        strategic > budget.saturating_sub(*buffer_minutes)
+                    })
+                {
+                    return Err(invalid("strategic time exceeds the budget after buffer"));
+                }
+                if importance_threshold.is_some_and(|value| !(1..100).contains(&value))
+                    || urgency_percent.is_some_and(|value| !(1..=1000).contains(&value))
+                {
+                    return Err(invalid(
+                        "priority thresholds must be 1–99 for importance and 1–1000% for urgency",
+                    ));
                 }
                 if let Some(decisions) = closing {
                     let ids: Vec<_> = decisions.iter().map(|decision| decision.task).collect();

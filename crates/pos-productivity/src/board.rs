@@ -1,5 +1,7 @@
 use crate::catalog::Catalog;
+use crate::history::EstimateRevision;
 use crate::model::*;
+use crate::planning::Planning;
 use crate::{Date, Timestamp};
 use jiff::tz::TimeZone;
 use serde::Serialize;
@@ -13,6 +15,8 @@ pub struct BoardTask {
     pub planned: bool,
     pub blockers: Vec<Uuid>,
     pub actual_seconds: i64,
+    pub total_actual_seconds: i64,
+    pub remaining_minutes: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -41,17 +45,28 @@ pub struct DayTotals {
 pub struct DayBoard {
     pub date: Date,
     pub timezone: String,
+    pub window: Interval,
+    pub as_of: Timestamp,
     pub plan: Option<Entity>,
     pub tasks: Vec<BoardTask>,
     pub inbox: Vec<Entity>,
     pub focus_goals: Vec<RoadmapGoal>,
     pub scheduled: Vec<TimelineItem>,
+    pub initial: Option<InitialPlan>,
+    pub estimate_revisions: Vec<EstimateRevision>,
     pub actual: Vec<TimelineItem>,
     pub overlaps: Vec<[Uuid; 2]>,
     pub focus: Option<Entity>,
     pub focus_elapsed_seconds: i64,
     pub totals: DayTotals,
     pub journal_path: Option<String>,
+    pub planning: Planning,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct InitialPlan {
+    pub task_titles: Option<Vec<String>>,
+    pub scheduled: Vec<TimelineItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +207,15 @@ impl Catalog {
                     .filter(|item| item.task == Some(id))
                     .map(|item| item.interval),
             );
+            let total_actual_seconds = union_seconds(self.entities().filter(|item|
+                matches!(item.item.fields, Fields::TimeEntry { task, .. } if task == id)
+            ).flat_map(|entry| entry_intervals(entry, now)));
+            let remaining_minutes =
+                estimate_minutes
+                    .or(*initial_estimate_minutes)
+                    .map(|estimate| {
+                        (f64::from(estimate) - total_actual_seconds as f64 / 60.0).max(0.0)
+                    });
             if *status == WorkStatus::Done {
                 totals.completed += 1;
             }
@@ -199,12 +223,8 @@ impl Catalog {
                 totals.tasks += 1;
             }
             if status.is_open() {
-                if let Some(estimate) = estimate_minutes.or(*initial_estimate_minutes) {
-                    let recorded = union_seconds(self.entities().filter(|item|
-                        matches!(item.item.fields, Fields::TimeEntry { task, .. } if task == id)
-                    ).flat_map(|entry| entry_intervals(entry, now)));
-                    totals.remaining_estimate_minutes += u64::from(estimate)
-                        .saturating_sub(u64::try_from(recorded / 60).unwrap_or(0));
+                if let Some(remaining) = remaining_minutes {
+                    totals.remaining_estimate_minutes += remaining.ceil() as u64;
                 } else {
                     totals.unestimated_tasks += 1;
                 }
@@ -227,6 +247,8 @@ impl Catalog {
                 planned: planned_tasks.contains(&id),
                 blockers,
                 actual_seconds,
+                total_actual_seconds,
+                remaining_minutes,
             });
         }
         board_tasks.sort_by_key(|row| {
@@ -294,25 +316,39 @@ impl Catalog {
                 overlaps.push([left.id, right.id]);
             }
         }
+        let planning = Planning::build(
+            self,
+            &board_tasks,
+            window,
+            &scheduled,
+            &actual,
+            now,
+            timezone,
+        )?;
         Ok(DayBoard {
             date,
             timezone: timezone.into(),
+            window,
+            as_of: now,
             plan: plan.cloned(),
             tasks: board_tasks,
             inbox,
             focus_goals,
             scheduled,
+            initial: None,
+            estimate_revisions: Vec::new(),
             actual,
             overlaps,
             focus,
             focus_elapsed_seconds,
             totals,
             journal_path: None,
+            planning,
         })
     }
 }
 
-fn timeline(
+pub(crate) fn timeline(
     entity: &Entity,
     kind: &'static str,
     task: Option<Uuid>,
@@ -327,7 +363,10 @@ fn timeline(
     }
 }
 
-fn entry_intervals(entity: &Entity, now: Timestamp) -> impl Iterator<Item = Interval> + '_ {
+pub(crate) fn entry_intervals(
+    entity: &Entity,
+    now: Timestamp,
+) -> impl Iterator<Item = Interval> + '_ {
     let (intervals, running) = match &entity.item.fields {
         Fields::TimeEntry {
             intervals,
@@ -350,13 +389,13 @@ fn entry_intervals(entity: &Entity, now: Timestamp) -> impl Iterator<Item = Inte
         )
 }
 
-fn clip(interval: Interval, bounds: Interval) -> Option<Interval> {
+pub(crate) fn clip(interval: Interval, bounds: Interval) -> Option<Interval> {
     let start = interval.start.max(bounds.start);
     let end = interval.end.min(bounds.end);
     (start < end).then_some(Interval { start, end })
 }
 
-fn union_seconds(intervals: impl Iterator<Item = Interval>) -> i64 {
+pub(crate) fn union_seconds(intervals: impl Iterator<Item = Interval>) -> i64 {
     let mut intervals: Vec<_> = intervals.collect();
     intervals.sort_by_key(|interval| interval.start);
     let mut merged = BTreeMap::new();

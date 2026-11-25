@@ -75,10 +75,6 @@
     return localInput ? [part('year'), part('month'), part('day')].join('-') + 'T' + time : time;
   }
 
-  function minutes(seconds) {
-    return Math.floor((seconds || 0) / 60) + ' 分钟';
-  }
-
   function timerText(seconds) {
     const time = Math.max(0, Math.floor(seconds));
     return [Math.floor(time / 3600), Math.floor(time % 3600 / 60), time % 60]
@@ -95,7 +91,12 @@
     const content = e('div', { class: 'pos-content' });
     view.notice = notice;
     view.content = content;
-    host.replaceChildren(connect, notice, content);
+    if (page === 'day') {
+      const connection = e('details', { class: 'day-vault', open: !settings.root },
+        e('summary', {}, 'Vault 连接'), connect);
+      host.replaceChildren(notice, content, connection);
+      view.connection = connection;
+    } else host.replaceChildren(connect, notice, content);
     connect.addEventListener('submit', event => {
       event.preventDefault();
       settings.root = root.value.trim();
@@ -130,6 +131,7 @@
       view.entries = entries;
       view.content.replaceChildren();
       if (view.page === 'day') {
+        view.connection.open = false;
         view.board = result;
         settings.date = result.date;
         renderDay(view, result);
@@ -146,87 +148,10 @@
   }
 
   function renderDay(view, board) {
-    const date = e('input', { type: 'date', value: board.date, 'aria-label': '看板日期', required: true });
-    date.addEventListener('change', () => {
-      if (date.value) { settings.date = date.value; load(view); }
+    window.PosDayBoard.render(view, board, {
+      e, action, message, list, row, section, edit, load, closeDay, focus, preview,
+      nowDate, timeText, statuses, settings,
     });
-    const zone = e('input', { value: board.timezone, 'aria-label': 'IANA 时区', class: 'pos-zone' });
-    zone.addEventListener('change', () => {
-      if (zone.value.trim()) { settings.zone = zone.value.trim(); load(view); }
-    });
-    const closed = board.plan?.closing != null;
-    const toolbar = e('div', { class: 'pos-toolbar' }, date, zone,
-      action('今天', () => { settings.date = null; load(view); }),
-      action('刷新', () => load(view)),
-      action('新建任务', () => edit(view, 'task'), 'pos-primary'),
-      action('编辑日计划', () => edit(view, 'daily_plan', board.plan)),
-      action('新建日程', () => edit(view, 'event')),
-      action('安排时间块', () => edit(view, 'time_block')),
-      action('记录实际时间', () => edit(view, 'time_entry')),
-      closed ? message('当日计划已结案') : action('结束一天', () => closeDay(view)),
-    );
-    const totals = board.totals;
-    const summary = e('div', { class: 'pos-metrics' },
-      metric('任务完成', totals.completed + ' / ' + totals.tasks),
-      metric('计划工作', minutes(totals.planned_work_seconds)),
-      metric('实际投入', minutes(totals.actual_seconds)),
-      metric('剩余估算', totals.remaining_estimate_minutes + ' 分钟'),
-    );
-    const focusList = list(board.focus_goals.map(item => row(item.goal.title,
-      item.milestones.find(stage => stage.id === item.current_milestone)?.title)), '暂无重点目标');
-    const inbox = list(board.inbox.map(task => row(task.title, task.category, [
-      ...(!closed ? [action('排入当天', () => preview(view, { action: 'schedule_task', date: board.date, task: task.id }))] : []),
-      action('编辑', () => edit(view, 'task', task)),
-    ])), '暂无待安排任务');
-    const boardGroups = Object.entries(statuses).map(([status, label]) => e('div', { class: 'pos-lane' },
-      e('h3', {}, label),
-      list(board.tasks.filter(entry => entry.task.status === status).map(entry => {
-        const task = entry.task;
-        const detail = [
-          entry.priority ? '重点' : null,
-          entry.blockers.length ? entry.blockers.length + ' 个前置任务未完成' : null,
-          entry.actual_seconds ? minutes(entry.actual_seconds) : null,
-        ].filter(Boolean).join(' · ');
-        const buttons = [action('编辑', () => edit(view, 'task', task))];
-        if (status === 'todo' || status === 'doing') {
-          buttons.unshift(action(status === 'todo' ? '开始' : '完成', () =>
-            preview(view, { action: 'set_task_status', id: task.id, status: status === 'todo' ? 'doing' : 'done' })));
-          if (!board.focus) buttons.push(action('专注', () => preview(view, { action: 'focus_start', task: task.id })));
-          if (!closed && !entry.priority) buttons.push(action('设为重点', () =>
-            preview(view, { action: 'schedule_task', date: board.date, task: task.id, priority: true })));
-        }
-        return row(task.title, detail, buttons);
-      }), '无任务'),
-    ));
-    const attention = [
-      board.overlaps.length ? board.overlaps.length + ' 组计划时间重叠' : null,
-      totals.available_work_minutes !== null && totals.remaining_estimate_minutes > totals.available_work_minutes
-        ? '剩余估算超过可用时间 ' + (totals.remaining_estimate_minutes - totals.available_work_minutes) + ' 分钟' : null,
-      totals.unestimated_tasks ? totals.unestimated_tasks + ' 项待执行任务缺少估算' : null,
-    ].filter(Boolean);
-    const left = e('div', { class: 'pos-column' }, section('长期重点', focusList), section('待安排', inbox));
-    const center = e('div', { class: 'pos-column' }, section('专注计时', focus(view, board)),
-      section('任务看板', e('div', { class: 'pos-kanban' }, boardGroups)));
-    const right = e('div', { class: 'pos-column' },
-      section('计划时间轴', timeline(view, board.scheduled, '暂无日程')),
-      section('实际记录', timeline(view, board.actual, '暂无用时记录')),
-      section('待关注', list(attention, '暂无提醒'),
-        board.journal_path ? message('日记 · ' + board.journal_path) : null),
-    );
-    view.content.append(toolbar, summary, e('div', { class: 'pos-day' }, left, center, right));
-  }
-
-  function metric(label, value) {
-    return e('div', { class: 'pos-metric' }, e('span', {}, label), e('strong', {}, value));
-  }
-
-  function timeline(view, items, empty) {
-    return list(items.map(item => {
-      const entity = view.entries.find(entry => entry.id === item.id);
-      const interval = timeText(item.start, settings.zone) + ' – ' + timeText(item.end, settings.zone);
-      return row(item.title, interval, entity && entity.status !== 'running' && entity.status !== 'paused'
-        ? [action('编辑', () => edit(view, entity.type, entity))] : []);
-    }), empty);
   }
 
   function focus(view, board) {
@@ -254,14 +179,24 @@
       action('刷新', () => load(view))));
     if (!roadmap.length) view.content.append(section('目标路线图', message('暂无目标')));
     for (const group of roadmap) {
+      const stages = group.milestones.filter(stage => stage.status !== 'cancelled');
       view.content.append(section(group.goal.title,
         row(statuses[group.goal.status] || '', null, [action('编辑目标', () => edit(view, 'goal', group.goal))]),
+        completion(group.goal.title, stages, '个里程碑'),
         list(group.milestones.map(stage => row(stage.sequence + ' · ' + stage.title,
           [stage.id === group.current_milestone ? '当前阶段' : statuses[stage.status], ...stage.exit_criteria].filter(Boolean).join(' · '),
           [action('编辑', () => edit(view, 'milestone', stage))])), '暂无里程碑'),
         group.projects.length ? message('关联项目 · ' + group.projects.map(project => project.title).join('、')) : null,
       ));
     }
+  }
+
+  function completion(title, items, unit) {
+    if (!items.length) return null;
+    const done = items.filter(item => item.status === 'done').length;
+    return e('div', { class: 'day-roadmap-progress' },
+      message(`${done} / ${items.length} ${unit}已完成`),
+      window.PosDayBoard.meter({ e }, done / items.length, title + '进度'));
   }
 
   function renderProjects(view) {
@@ -271,8 +206,11 @@
       action('刷新', () => load(view))));
     for (const kind of ['project', 'task']) {
       view.content.append(section(kind === 'project' ? '项目' : '任务',
-        list(view.entries.filter(item => item.type === kind).map(item => row(item.title, statuses[item.status],
-          [action('编辑', () => edit(view, kind, item))])), kind === 'project' ? '暂无项目' : '暂无任务')));
+        list(view.entries.filter(item => item.type === kind).map(item => e('div', {},
+          row(item.title, statuses[item.status], [action('编辑', () => edit(view, kind, item))]),
+          kind === 'project' ? completion(item.title, view.entries.filter(task => task.type === 'task'
+            && task.project === item.id && task.status !== 'cancelled'), '项任务') : null)),
+        kind === 'project' ? '暂无项目' : '暂无任务')));
     }
   }
 
@@ -325,21 +263,40 @@
     const numeric = (name, label, value, minimum = 0) => input(name, label, value ?? '', { type: 'number', min: minimum, max: 4294967295, step: 1 });
     const status = () => choice('status', '状态', Object.entries(statuses), current.status || 'todo', true);
     const interval = current.interval || current.intervals?.[0];
+    const currentWindows = current.work_windows?.map(interval => {
+      const start = timeText(interval.start, settings.zone, true);
+      const end = timeText(interval.end, settings.zone, true);
+      return start.slice(11) + '-' + (end.slice(0, 10) !== current.date && end.slice(11) === '00:00' ? '24:00' : end.slice(11));
+    });
+    const checkbox = (name, label, checked) => e('label', { class: 'pos-check' },
+      e('input', { type: 'checkbox', name, checked }), e('span', {}, label));
     const controls = [input('title', '标题', current.title || (kind === 'daily_plan' ? '日计划 ' + day : ''), { required: true })];
     if (['goal', 'milestone', 'project', 'task'].includes(kind)) controls.push(status());
     if (kind === 'milestone') controls.push(reference('goal', '所属目标', 'goal', true),
       numeric('sequence', '阶段顺序', current.sequence ?? 1, 1),
+      input('due_at', '截止时间', current.due_at ? timeText(current.due_at, settings.zone, true) : '', { type: 'datetime-local' }),
       field('验收条件（每行一项）', e('textarea', { name: 'exit_criteria', rows: 3 }, (current.exit_criteria || []).join('\n'))));
     if (kind === 'project') controls.push(references('goals', '关联目标', 'goal'), references('milestones', '关联里程碑', 'milestone'));
     if (kind === 'task') controls.push(reference('project', '所属项目', 'project'), references('goals', '关联目标', 'goal'),
       reference('milestone', '关联里程碑', 'milestone'), references('depends_on', '前置任务', 'task'),
       input('due_at', '截止时间', current.due_at ? timeText(current.due_at, settings.zone, true) : '', { type: 'datetime-local' }),
       numeric('estimate_minutes', '预计耗时（分钟）', current.estimate_minutes ?? current.initial_estimate_minutes, 1),
-      input('category', '类别', current.category || ''));
+      input('category', '类别', current.category || ''),
+      input('importance', '重要性（0–100）', current.importance ?? '', { type: 'number', min: 0, max: 100, step: 1 }),
+      field('检查点（每行一项）', e('textarea', { name: 'checkpoints', rows: 3 },
+        (current.checkpoints || []).map(item => item.title).join('\n'))),
+      field('实际产出', e('textarea', { name: 'outcome', rows: 2 }, current.outcome || '')),
+      checkbox('exclude_from_estimates', '范围变更或记录不完整，排除出历史估时', current.exclude_from_estimates));
     if (kind === 'daily_plan') controls.push(input('date', '日期', current.date || day, { type: 'date', readonly: Boolean(existing), required: true }),
       references('tasks', '安排任务', 'task'), references('priority_tasks', '重点任务', 'task'),
       references('focus_goals', '当日重点目标', 'goal'), numeric('budget_minutes', '预算（分钟）', current.budget_minutes),
-      numeric('buffer_minutes', '缓冲（分钟）', current.buffer_minutes ?? 0));
+      numeric('buffer_minutes', '缓冲（分钟）', current.buffer_minutes ?? 0),
+      numeric('strategic_minutes', '战略时间目标（分钟）', current.strategic_minutes),
+      input('importance_threshold', '四象限重要性阈值', current.importance_threshold ?? '', { type: 'number', min: 1, max: 99, step: 1, placeholder: '70' }),
+      input('urgency_percent', '四象限紧迫度阈值（%）', current.urgency_percent ?? '', { type: 'number', min: 1, max: 1000, step: 1, placeholder: '70' }),
+      checkbox('configure_windows', '明确配置当天可工作时段（日休可留空）', current.work_windows != null),
+      field('可工作时段（每行一段）', e('textarea', { name: 'work_windows', rows: 3, placeholder: '09:00-12:00\n14:00-18:00' },
+        currentWindows?.join('\n') || '')));
     if (kind === 'time_block' || kind === 'time_entry') controls.push(reference('task', '关联任务', 'task', true));
     if (['event', 'time_block', 'time_entry'].includes(kind)) {
       controls.push(input('start', '开始', interval ? timeText(interval.start, settings.zone, true) : day + 'T09:00', { type: 'datetime-local', required: true }),
@@ -349,31 +306,52 @@
       report(view, '这条专注记录包含多个区间，可通过 CLI 编辑完整记录。');
       return;
     }
+    if (kind === 'task' && existing) controls.push(input('estimate_reason', '估时调整原因（可选）'));
     formDialog(view, (existing ? '编辑' : '新建') + labels[kind], controls, '预览变更', async form => {
       const value = name => String(form.get(name) || '').trim();
       const all = name => form.getAll(name);
       const number = name => value(name) ? Number(value(name)) : null;
+      const lines = name => value(name).split('\n').map(text => text.trim()).filter(Boolean);
       const instant = async name => value(name)
         ? invoke('wall_time', { time: value(name), timezone: settings.zone }) : null;
       const item = { type: kind, title: value('title') };
       if (form.has('status')) item.status = value('status');
       if (kind === 'milestone') Object.assign(item, { goal: value('goal'), sequence: number('sequence'),
-        exit_criteria: value('exit_criteria').split('\n').map(text => text.trim()).filter(Boolean) });
+        due_at: await instant('due_at'), exit_criteria: lines('exit_criteria') });
       if (kind === 'project') Object.assign(item, { goals: all('goals'), milestones: all('milestones') });
       if (kind === 'task') Object.assign(item, { project: value('project') || null, goals: all('goals'), milestone: value('milestone') || null,
         depends_on: all('depends_on'), due_at: await instant('due_at'),
         initial_estimate_minutes: current.initial_estimate_minutes ?? number('estimate_minutes'),
-        estimate_minutes: number('estimate_minutes'), category: value('category') || null });
+        estimate_minutes: number('estimate_minutes'), category: value('category') || null,
+        importance: number('importance'), outcome: value('outcome') || null,
+        exclude_from_estimates: form.has('exclude_from_estimates'),
+        checkpoints: lines('checkpoints').map(title => ({
+          title, done: current.checkpoints?.some(item => item.title === title && item.done) || false,
+        })) });
       if (kind === 'daily_plan') Object.assign(item, { date: value('date'), tasks: all('tasks'),
         priority_tasks: all('priority_tasks'), focus_goals: all('focus_goals'),
-        budget_minutes: number('budget_minutes'), buffer_minutes: number('buffer_minutes') || 0, closing: current.closing || null });
+        budget_minutes: number('budget_minutes'), buffer_minutes: number('buffer_minutes') || 0,
+        strategic_minutes: number('strategic_minutes'), importance_threshold: number('importance_threshold'),
+        urgency_percent: number('urgency_percent'), closing: current.closing || null,
+        work_windows: currentWindows && form.has('configure_windows') && value('work_windows') === currentWindows.join('\n')
+          ? current.work_windows : form.has('configure_windows') || lines('work_windows').length
+          ? await Promise.all(lines('work_windows').map(async line => {
+            const match = /^((?:[01]\d|2[0-3]):[0-5]\d)\s*-\s*((?:[01]\d|2[0-3]):[0-5]\d|24:00)$/.exec(line);
+            if (!match || match[1] >= match[2]) throw new Error('可工作时段应按 09:00-12:00 填写，且结束需晚于开始。');
+            const [start, end] = await Promise.all(match.slice(1).map(time => {
+              const date = new Date(value('date') + 'T12:00:00Z');
+              if (time === '24:00') date.setUTCDate(date.getUTCDate() + 1);
+              return invoke('wall_time', { time: date.toISOString().slice(0, 10) + 'T' + (time === '24:00' ? '00:00' : time), timezone: settings.zone });
+            }));
+            return { start, end };
+          })) : null });
       if (['event', 'time_block', 'time_entry'].includes(kind)) {
         const times = { start: await instant('start'), end: await instant('end') };
         if (kind === 'time_entry') Object.assign(item, { task: value('task'), intervals: [times], status: 'finished' });
         else Object.assign(item, { interval: times, ...(kind === 'time_block' ? { task: value('task') } : {}) });
       }
       const command = existing ? { action: 'edit', id: existing.id, item } : { action: 'create', item };
-      const plan = await invoke('preview', { root: view.root, action: command, reason: null });
+      const plan = await invoke('preview', { root: view.root, action: command, reason: value('estimate_reason') || null });
       return () => confirm(view, plan);
     });
   }

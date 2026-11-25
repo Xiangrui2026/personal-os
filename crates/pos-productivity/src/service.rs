@@ -45,7 +45,9 @@ impl Productivity {
         timezone: &str,
         now: Timestamp,
     ) -> Result<DayBoard, ProductivityError> {
-        let mut board = self.catalog()?.day(date, timezone, now)?;
+        let catalog = self.catalog()?;
+        let mut board = catalog.day(date, timezone, now)?;
+        crate::history::attach(&catalog, &mut board, self.changes.list()?);
         let journal = format!("Journal/{date}.md");
         if self.vault.read(&journal).is_ok() {
             board.journal_path = Some(journal);
@@ -150,6 +152,17 @@ fn propose(
             }
             Ok((entity, None))
         }
+        Action::SetCheckpoint { id, title, done } => {
+            let mut entity = catalog.require(id, "task")?.clone();
+            if let Fields::Task { checkpoints, .. } = &mut entity.item.fields {
+                let checkpoint = checkpoints
+                    .iter_mut()
+                    .find(|item| item.title == title)
+                    .ok_or_else(|| invalid("checkpoint no longer exists"))?;
+                checkpoint.done = done;
+            }
+            Ok((entity, None))
+        }
         Action::ScheduleTask {
             date,
             task,
@@ -236,6 +249,10 @@ fn daily_plan(
                 focus_goals: Vec::new(),
                 budget_minutes: None,
                 buffer_minutes: 0,
+                work_windows: None,
+                strategic_minutes: None,
+                importance_threshold: None,
+                urgency_percent: None,
                 closing: None,
             },
         },

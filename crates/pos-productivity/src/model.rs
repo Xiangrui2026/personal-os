@@ -57,6 +57,13 @@ pub struct Interval {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub title: String,
+    #[serde(default)]
+    pub done: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Disposition {
     Move { date: Date },
@@ -85,6 +92,8 @@ pub enum Fields {
         status: WorkStatus,
         #[serde(default)]
         exit_criteria: Vec<String>,
+        #[serde(default)]
+        due_at: Option<Timestamp>,
     },
     Project {
         #[serde(default)]
@@ -113,6 +122,14 @@ pub enum Fields {
         estimate_minutes: Option<u32>,
         #[serde(default)]
         category: Option<String>,
+        #[serde(default)]
+        importance: Option<u8>,
+        #[serde(default)]
+        checkpoints: Vec<Checkpoint>,
+        #[serde(default)]
+        outcome: Option<String>,
+        #[serde(default)]
+        exclude_from_estimates: bool,
     },
     DailyPlan {
         date: Date,
@@ -126,6 +143,14 @@ pub enum Fields {
         budget_minutes: Option<u32>,
         #[serde(default)]
         buffer_minutes: u32,
+        #[serde(default)]
+        work_windows: Option<Vec<Interval>>,
+        #[serde(default)]
+        strategic_minutes: Option<u32>,
+        #[serde(default)]
+        importance_threshold: Option<u8>,
+        #[serde(default)]
+        urgency_percent: Option<u16>,
         #[serde(default)]
         closing: Option<Vec<ClosingDecision>>,
     },
@@ -220,6 +245,11 @@ pub enum Action {
     SetTaskStatus {
         id: Uuid,
         status: WorkStatus,
+    },
+    SetCheckpoint {
+        id: Uuid,
+        title: String,
+        done: bool,
     },
     ScheduleTask {
         date: Date,

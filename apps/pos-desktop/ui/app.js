@@ -131,13 +131,13 @@ function render({ focus = false } = {}) {
   }
 
   breadcrumb.textContent = label;
-  page.innerHTML = id === 'overview' ? overview() : `
+  page.innerHTML = id === 'overview' ? overview() : id === 'day' ? '<div id="productivity"></div>' : `
     <header class="page-heading">
       ${tile(id)}
       <h1 id="page-title">${label}</h1>
       <p>${description}</p>
     </header>
-    ${['day', 'roadmap', 'projects'].includes(id) ? '<div id="productivity"></div>' : pageContent[id]()}`;
+    ${['roadmap', 'projects'].includes(id) ? '<div id="productivity"></div>' : pageContent[id]()}`;
   const productivity = page.querySelector('#productivity');
   if (productivity) window.PosProductivity.mount(productivity, id);
   page.parentElement.scrollTop = 0;
