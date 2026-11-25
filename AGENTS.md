@@ -23,3 +23,5 @@
 ## 本地数据优先使用 Obsidian Markdown
 
 笔记、日志、目标和计划等适合用 Markdown 和 YAML 属性表达的数据，以 Obsidian Vault 为主存储。只有明确需要持久化结构化数据时，才在 Vault 之外使用独立的 SQLite 文件。由 Markdown 可重建的索引优先保存在内存中。
+
+Change Engine 的版本控制数据按项目约定使用 Vault 根目录下的 `.maggot`。该目录内的写入遵守真实 Vault 的确认规则。
