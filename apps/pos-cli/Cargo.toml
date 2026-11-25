@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 pos-change = { path = "../../crates/pos-change" }
+pos-productivity = { path = "../../crates/pos-productivity" }
 pos-vault = { path = "../../crates/pos-vault" }
 serde = "1"
 serde_json = "1"

@@ -7,6 +7,8 @@ edition = "2024"
 tauri-build = "2"
 
 [dependencies]
+pos-change = { path = "../../crates/pos-change" }
+pos-productivity = { path = "../../crates/pos-productivity" }
 tauri = "2"
 
 [features]

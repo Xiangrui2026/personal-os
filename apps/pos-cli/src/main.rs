@@ -1,4 +1,5 @@
 mod change;
+mod productivity;
 
 use change::{BackupAction, ChangeAction, LinkAction};
 use clap::{Parser, Subcommand};
@@ -45,6 +46,13 @@ enum Command {
         #[command(subcommand)]
         action: BackupAction,
     },
+    /// Manage goals, tasks, daily plans, calendar and actual time.
+    Productivity {
+        #[arg(long, value_name = "DIRECTORY")]
+        root: PathBuf,
+        #[command(subcommand)]
+        action: productivity::ProductivityAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -90,6 +98,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Change { root, action } => change::run(root, action),
         Command::Link { root, action } => change::link(root, action),
         Command::Backup { action } => change::backup(action),
+        Command::Productivity { root, action } => productivity::run(root, action),
     }
 }
 

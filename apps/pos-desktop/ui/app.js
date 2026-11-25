@@ -1,9 +1,10 @@
 const groups = [
-  { label: '工作区', pages: ['overview', 'roadmap', 'projects', 'knowledge', 'resources', 'review'] },
+  { label: '工作区', pages: ['day', 'overview', 'roadmap', 'projects', 'knowledge', 'resources', 'review'] },
   { label: '数据管理', pages: ['changes', 'backup'] },
 ];
 
 const pages = {
+  day: { label: '每日看板', icon: '\uE787', description: '安排任务、日程和专注时间' },
   overview: { label: '总览', icon: '\uE80F' },
   roadmap: { label: '目标路线图', icon: '\uE902', description: '长期目标与阶段里程碑' },
   projects: { label: '项目', icon: '\uE8F1', description: '计划、任务与研究进展' },
@@ -15,12 +16,6 @@ const pages = {
 };
 
 const pageContent = {
-  roadmap: () => `
-    <div class="detail-grid">
-      ${panel('长期目标', '暂无目标', 'roadmap')}
-      ${panel('阶段路线图', '暂无里程碑', 'roadmap')}
-    </div>`,
-  projects: () => table('项目列表', ['项目', '关联目标', '状态'], '暂无项目'),
   knowledge: () => `
     <div class="detail-grid">
       ${panel('笔记', '暂无笔记', 'knowledge')}
@@ -95,7 +90,7 @@ function card(id) {
 }
 
 function overview() {
-  const workspace = groups[0].pages.slice(1);
+  const workspace = groups[0].pages.filter(id => id !== 'overview');
   return `
     <section class="hero" aria-labelledby="page-title">
       <div class="hero-art" aria-hidden="true">
@@ -127,7 +122,7 @@ navigation.innerHTML = groups.map(({ label, pages: ids }) => `
 
 function render({ focus = false } = {}) {
   const hash = window.location.hash.slice(1);
-  const id = Object.hasOwn(pages, hash) ? hash : 'overview';
+  const id = Object.hasOwn(pages, hash) ? hash : 'day';
   const { label, description } = pages[id];
 
   for (const link of navigation.querySelectorAll('a')) {
@@ -142,7 +137,9 @@ function render({ focus = false } = {}) {
       <h1 id="page-title">${label}</h1>
       <p>${description}</p>
     </header>
-    ${pageContent[id]()}`;
+    ${['day', 'roadmap', 'projects'].includes(id) ? '<div id="productivity"></div>' : pageContent[id]()}`;
+  const productivity = page.querySelector('#productivity');
+  if (productivity) window.PosProductivity.mount(productivity, id);
   page.parentElement.scrollTop = 0;
   if (focus) page.focus({ preventScroll: true });
 }

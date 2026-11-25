@@ -12,3 +12,10 @@ pub use note::{
 pub use property::{PropertyEdit, prepare_property};
 pub use vault::{IssueKind, NoteSource, Vault, VaultError, VaultInfo, VaultIssue};
 pub use watch::{VaultChanges, VaultWatch};
+
+pub fn parse_document(path: &str, text: &str) -> Result<Note, VaultError> {
+    note::parse(path.to_owned(), text).map_err(|message| VaultError::InvalidNote {
+        path: path.to_owned(),
+        message,
+    })
+}

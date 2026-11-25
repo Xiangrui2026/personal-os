@@ -128,7 +128,16 @@ impl ChangeEngine {
     pub fn apply(
         &self,
         approved: &ChangePlan,
+        exclusive: &ExclusiveWrite,
+    ) -> Result<ChangeRecord, ChangeError> {
+        self.apply_checked(approved, exclusive, |_, _| Ok(()))
+    }
+
+    pub fn apply_checked(
+        &self,
+        approved: &ChangePlan,
         _exclusive: &ExclusiveWrite,
+        validate: impl FnOnce(&ChangePlan, &str) -> Result<(), ChangeError>,
     ) -> Result<ChangeRecord, ChangeError> {
         if approved.vault_root != self.root {
             return Err(conflict("the preview belongs to a different vault path"));
@@ -166,6 +175,7 @@ impl ChangeEngine {
         if let Some(pending) = store.pending_for(&plan.request.path)? {
             return Err(ChangeError::Pending(pending));
         }
+        validate(&plan, &after)?;
         if plan.before_exists {
             self.record_unseen_preimage(&mut store, &plan)?;
         }
