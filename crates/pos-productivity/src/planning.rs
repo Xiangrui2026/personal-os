@@ -97,6 +97,7 @@ impl Planning {
         let mut estimated = 0;
         let mut calibrated_remaining = 0.0;
         let mut calibrated_tasks = 0;
+        let mut missing_calibration = false;
         let mut priorities = Vec::new();
         for row in tasks {
             let Fields::Task {
@@ -128,9 +129,9 @@ impl Planning {
                 factor
                     .zip(estimate_minutes.or(*initial_estimate_minutes))
                     .map(|(factor, estimate)| {
-                        (f64::from(estimate) * factor - row.total_actual_seconds as f64 / 60.0)
-                            .max(0.0)
+                        f64::from(estimate) * factor - row.total_actual_seconds as f64 / 60.0
                     })
+                    .filter(|remaining| *remaining > 0.0)
             };
             let p50_remaining_minutes = adjusted(sample.and_then(|sample| sample.p50));
             let p80_remaining_minutes = adjusted(sample.and_then(|sample| sample.p80));
@@ -140,6 +141,8 @@ impl Planning {
                 calibrated_tasks += 1;
             } else if let Some(remaining) = row.remaining_minutes {
                 calibrated_remaining += remaining;
+            } else {
+                missing_calibration = true;
             }
             let deadline = plans.deadline(row.task.id, *due_at, *milestone, day.start)?;
             let overdue = deadline.is_some_and(|(deadline, _)| deadline <= from);
@@ -197,9 +200,10 @@ impl Planning {
             remaining_work_minutes,
             workload_ratio: remaining_work_minutes
                 .filter(|available| *available > 0.0)
-                .filter(|_| estimated > 0 || priorities.is_empty())
+                .filter(|_| estimated == priorities.len())
                 .map(|available| demand / available),
-            calibrated_remaining_minutes: (calibrated_tasks > 0).then_some(calibrated_remaining),
+            calibrated_remaining_minutes: (calibrated_tasks > 0 && !missing_calibration)
+                .then_some(calibrated_remaining),
             calibrated_tasks,
             priorities,
             estimates,

@@ -45,6 +45,46 @@ impl Productivity {
         timezone: &str,
         now: Timestamp,
     ) -> Result<DayBoard, ProductivityError> {
+        let end = date
+            .tomorrow()?
+            .to_zoned(TimeZone::get(timezone)?)?
+            .timestamp();
+        if now >= end {
+            return self.day_as_of(date, timezone, end);
+        }
+        self.day_latest(date, timezone, now)
+    }
+
+    pub fn day_as_of(
+        &self,
+        date: Date,
+        timezone: &str,
+        cutoff: Timestamp,
+    ) -> Result<DayBoard, ProductivityError> {
+        let mut records = self.changes.list()?;
+        records.retain(|record| record.executed_unix_ms < cutoff.as_millisecond());
+        let mut items = std::collections::BTreeMap::new();
+        for (path, text) in self
+            .changes
+            .recorded_documents(&records, crate::catalog::managed_path)?
+        {
+            if let Some(entity) = from_note(&parse_document(&path, &text)?)? {
+                items.insert(entity.id, entity);
+            }
+        }
+        let catalog = Catalog::from_items(items)?;
+        let mut board = catalog.project_day(date, timezone, cutoff, true)?;
+        board.snapshot_entities = Some(catalog.entities().cloned().collect());
+        crate::history::attach(&catalog, &mut board, records);
+        Ok(board)
+    }
+
+    pub fn day_latest(
+        &self,
+        date: Date,
+        timezone: &str,
+        now: Timestamp,
+    ) -> Result<DayBoard, ProductivityError> {
         let catalog = self.catalog()?;
         let mut board = catalog.day(date, timezone, now)?;
         crate::history::attach(&catalog, &mut board, self.changes.list()?);
@@ -64,7 +104,8 @@ impl Productivity {
     ) -> Result<ChangePlan, ProductivityError> {
         let catalog = self.catalog()?;
         let change_id = Uuid::new_v4();
-        let (entity, body) = propose(&catalog, action, change_id, at)?;
+        let (mut entity, body) = propose(&catalog, action, change_id, at)?;
+        reconcile_task(catalog.get(entity.id).ok(), &mut entity.item.fields, at)?;
         catalog.validate(&entity, body.is_some())?;
         let kind = entity.item.fields.kind();
         let document = Document {
@@ -81,14 +122,29 @@ impl Productivity {
         } else {
             Operation::set_property(PROPERTY, serde_json::to_value(document)?)
         };
-        Ok(self.changes.preview(ChangeRequest {
+        let plan = self.changes.preview(ChangeRequest {
             change_id,
             path: entity.path,
             actor_id: actor.into(),
             device_id: None,
             reason,
             operation,
-        })?)
+        })?;
+        if plan.before_exists {
+            let previous = parse_document(
+                &plan.request.path,
+                &format!("---\n{}\n---\n", plan.patch.before.trim_end()),
+            )?;
+            let value = previous
+                .frontmatter
+                .get(PROPERTY)
+                .ok_or_else(|| invalid("任务数据已变化，请刷新重试"))?;
+            let doc: Document = serde_json::from_value(value.clone())?;
+            if doc.item != catalog.get(entity.id)?.item {
+                return Err(invalid("生成预览期间数据已变化，请刷新重试"));
+            }
+        }
+        Ok(plan)
     }
 
     pub fn apply(
@@ -136,9 +192,51 @@ fn propose(
     at: Timestamp,
 ) -> Result<(Entity, Option<String>), ProductivityError> {
     match action {
+        Action::ReestimateRemaining { id, minutes } => {
+            if minutes == 0 || !catalog.task_open(id) {
+                return Err(invalid("请为未完成任务填写正数分钟"));
+            }
+            let spent = crate::board::union_seconds(catalog.entities().filter(|item|
+                matches!(item.item.fields, Fields::TimeEntry { task, .. } if task == id))
+                .flat_map(|item| crate::board::entry_intervals(item, at)));
+            let total = u32::try_from((spent + 59) / 60)
+                .ok()
+                .and_then(|spent| spent.checked_add(minutes))
+                .ok_or_else(|| invalid("估时超出可记录范围"))?;
+            let mut entity = catalog.require(id, "task")?.clone();
+            if let Fields::Task {
+                estimate_minutes, ..
+            } = &mut entity.item.fields
+            {
+                *estimate_minutes = Some(total);
+            }
+            Ok((entity, None))
+        }
         Action::Create { item, body } => Ok(new_entity(id, item, body)),
-        Action::Edit { id, item } => {
+        Action::Edit { id, mut item } => {
             let mut entity = catalog.get(id)?.clone();
+            if let (
+                Fields::Task {
+                    focus_sessions: saved,
+                    ..
+                },
+                Fields::Task { focus_sessions, .. },
+            ) = (&entity.item.fields, &mut item.fields)
+            {
+                focus_sessions.clone_from(saved);
+            }
+            if let Fields::TimeEntry { task, .. } = entity.item.fields
+                && entity.path == catalog.get(task)?.path
+            {
+                if item.title != entity.item.title {
+                    return Err(invalid("专注记录沿用任务标题"));
+                }
+                if !matches!(item.fields, Fields::TimeEntry { task: owner, .. } if owner == task) {
+                    return Err(invalid("专注记录必须保留原任务"));
+                }
+                entity.item = item;
+                return save_session(catalog, entity);
+            }
             entity.item = item;
             Ok((entity, None))
         }
@@ -154,7 +252,15 @@ fn propose(
         }
         Action::SetCheckpoint { id, title, done } => {
             let mut entity = catalog.require(id, "task")?.clone();
-            if let Fields::Task { checkpoints, .. } = &mut entity.item.fields {
+            if let Fields::Task {
+                checkpoints,
+                status,
+                ..
+            } = &mut entity.item.fields
+            {
+                if *status == WorkStatus::Cancelled {
+                    return Err(invalid("请先恢复已取消的任务"));
+                }
                 let checkpoint = checkpoints
                     .iter_mut()
                     .find(|item| item.title == title)
@@ -201,17 +307,25 @@ fn propose(
             Ok((entity, body))
         }
         Action::FocusStart { task } => {
-            let task_doc = catalog.require(task, "task")?;
-            let item = Item {
-                title: task_doc.item.title.clone(),
-                fields: Fields::TimeEntry {
-                    task,
+            let mut entity = catalog.require(task, "task")?.clone();
+            if let Fields::Task {
+                status,
+                focus_sessions,
+                ..
+            } = &mut entity.item.fields
+            {
+                if !status.is_open() {
+                    return Err(invalid("只有未完成的任务可以开始专注"));
+                }
+                *status = WorkStatus::Doing;
+                focus_sessions.push(FocusSession {
+                    id,
                     intervals: Vec::new(),
                     status: EntryStatus::Running,
                     running_since: Some(at),
-                },
-            };
-            Ok(new_entity(id, item, String::new()))
+                });
+            }
+            Ok((entity, None))
         }
         action @ (Action::FocusPause | Action::FocusResume | Action::FocusStop) => {
             focus_transition(catalog, action, at)
@@ -219,9 +333,101 @@ fn propose(
     }
 }
 
+fn reconcile_task(
+    previous: Option<&Entity>,
+    fields: &mut Fields,
+    at: Timestamp,
+) -> Result<(), ProductivityError> {
+    let Fields::Task {
+        status,
+        checkpoints,
+        focus_sessions,
+        ..
+    } = fields
+    else {
+        return Ok(());
+    };
+    let old = previous.and_then(|entity| match &entity.item.fields {
+        Fields::Task {
+            checkpoints,
+            status,
+            ..
+        } => Some((checkpoints, *status)),
+        _ => None,
+    });
+    if *status != WorkStatus::Cancelled && !checkpoints.is_empty() {
+        if checkpoints.iter().all(|point| point.done) {
+            *status = WorkStatus::Done;
+        } else if old
+            .is_some_and(|(points, prior)| points != checkpoints && prior == WorkStatus::Done)
+            || (*status == WorkStatus::Todo
+                && checkpoints.iter().any(|point| point.done)
+                && old.is_none_or(|(points, _)| points != checkpoints))
+        {
+            *status = WorkStatus::Doing;
+        }
+    }
+    if !status.is_open() {
+        for session in focus_sessions
+            .iter_mut()
+            .filter(|session| session.status != EntryStatus::Finished)
+        {
+            finish_interval(&mut session.intervals, &mut session.running_since, at)?;
+            session.status = EntryStatus::Finished;
+        }
+    }
+    Ok(())
+}
+
+fn finish_interval(
+    intervals: &mut Vec<Interval>,
+    running: &mut Option<Timestamp>,
+    at: Timestamp,
+) -> Result<(), ProductivityError> {
+    if let Some(start) = running.take() {
+        if at < start {
+            return Err(invalid("focus end is before its start"));
+        }
+        if at > start {
+            intervals.push(Interval { start, end: at });
+        }
+    }
+    Ok(())
+}
+
+fn save_session(
+    catalog: &Catalog,
+    entry: Entity,
+) -> Result<(Entity, Option<String>), ProductivityError> {
+    let Fields::TimeEntry {
+        task,
+        status,
+        running_since,
+        ref intervals,
+    } = entry.item.fields
+    else {
+        return Err(invalid("expected time entry"));
+    };
+    let mut owner = catalog.require(task, "task")?.clone();
+    if entry.path != owner.path {
+        return Ok((entry, None));
+    }
+    if let Fields::Task { focus_sessions, .. } = &mut owner.item.fields {
+        let session = focus_sessions
+            .iter_mut()
+            .find(|session| session.id == entry.id)
+            .ok_or_else(|| invalid("专注记录已变更"))?;
+        session.status = status;
+        session.running_since = running_since;
+        session.intervals.clone_from(intervals);
+    }
+    Ok((owner, None))
+}
+
 fn new_entity(id: Uuid, item: Item, body: String) -> (Entity, Option<String>) {
     (
         Entity {
+            progress: None,
             id,
             path: item.fields.path(id),
             item,
@@ -281,25 +487,18 @@ fn focus_transition(
     if matches!(action, Action::FocusResume) && *status == EntryStatus::Paused {
         *status = EntryStatus::Running;
         *running_since = Some(at);
-        return Ok((entry, None));
+        return save_session(catalog, entry);
     }
     if matches!(action, Action::FocusStop)
         || (matches!(action, Action::FocusPause) && *status == EntryStatus::Running)
     {
-        if let Some(start) = running_since.take() {
-            if at < start {
-                return Err(invalid("focus end is before its start"));
-            }
-            if at > start {
-                intervals.push(Interval { start, end: at });
-            }
-        }
+        finish_interval(intervals, running_since, at)?;
         *status = if matches!(action, Action::FocusStop) {
             EntryStatus::Finished
         } else {
             EntryStatus::Paused
         };
-        return Ok((entry, None));
+        return save_session(catalog, entry);
     }
     Err(invalid("invalid focus transition"))
 }

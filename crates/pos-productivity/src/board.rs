@@ -17,6 +17,7 @@ pub struct BoardTask {
     pub actual_seconds: i64,
     pub total_actual_seconds: i64,
     pub remaining_minutes: Option<f64>,
+    pub needs_reestimate: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -39,6 +40,7 @@ pub struct DayTotals {
     pub available_work_minutes: Option<u32>,
     pub remaining_estimate_minutes: u64,
     pub unestimated_tasks: usize,
+    pub exhausted_estimates: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +51,7 @@ pub struct DayBoard {
     pub as_of: Timestamp,
     pub plan: Option<Entity>,
     pub tasks: Vec<BoardTask>,
+    pub next_task: Option<Uuid>,
     pub inbox: Vec<Entity>,
     pub focus_goals: Vec<RoadmapGoal>,
     pub scheduled: Vec<TimelineItem>,
@@ -60,6 +63,7 @@ pub struct DayBoard {
     pub focus_elapsed_seconds: i64,
     pub totals: DayTotals,
     pub journal_path: Option<String>,
+    pub snapshot_entities: Option<Vec<Entity>>,
     pub planning: Planning,
 }
 
@@ -105,6 +109,16 @@ impl Catalog {
         date: Date,
         timezone: &str,
         now: Timestamp,
+    ) -> Result<DayBoard, ProductivityError> {
+        self.project_day(date, timezone, now, false)
+    }
+
+    pub(crate) fn project_day(
+        &self,
+        date: Date,
+        timezone: &str,
+        now: Timestamp,
+        historical: bool,
     ) -> Result<DayBoard, ProductivityError> {
         let zone = TimeZone::get(timezone)?;
         let first = date.to_zoned(zone.clone())?.timestamp();
@@ -152,9 +166,20 @@ impl Catalog {
                     tasks.insert(entity.id);
                 }
                 Fields::TimeEntry { task, .. } => {
+                    if let Fields::TimeEntry {
+                        running_since: Some(start),
+                        ..
+                    } = entity.item.fields
+                        && start <= now
+                        && first <= now
+                        && now < last
+                    {
+                        tasks.insert(*task);
+                    }
                     for interval in
                         entry_intervals(entity, now).filter_map(|interval| clip(interval, window))
                     {
+                        tasks.insert(*task);
                         actual.push(timeline(entity, "time_entry", Some(*task), interval));
                     }
                 }
@@ -182,6 +207,7 @@ impl Catalog {
             available_work_minutes: None,
             remaining_estimate_minutes: 0,
             unestimated_tasks: 0,
+            exhausted_estimates: 0,
         };
         totals.available_work_minutes = budget.map(|budget| {
             budget
@@ -190,6 +216,9 @@ impl Catalog {
         });
         let mut board_tasks = Vec::new();
         for id in tasks {
+            if historical && self.get(id).is_err() {
+                continue;
+            }
             let entity = self.require(id, "task")?;
             let Fields::Task {
                 status,
@@ -210,12 +239,14 @@ impl Catalog {
             let total_actual_seconds = union_seconds(self.entities().filter(|item|
                 matches!(item.item.fields, Fields::TimeEntry { task, .. } if task == id)
             ).flat_map(|entry| entry_intervals(entry, now)));
-            let remaining_minutes =
+            let estimated_remainder =
                 estimate_minutes
                     .or(*initial_estimate_minutes)
                     .map(|estimate| {
                         (f64::from(estimate) - total_actual_seconds as f64 / 60.0).max(0.0)
                     });
+            let needs_reestimate = status.is_open() && estimated_remainder == Some(0.0);
+            let remaining_minutes = estimated_remainder.filter(|_| !needs_reestimate);
             if *status == WorkStatus::Done {
                 totals.completed += 1;
             }
@@ -225,6 +256,8 @@ impl Catalog {
             if status.is_open() {
                 if let Some(remaining) = remaining_minutes {
                     totals.remaining_estimate_minutes += remaining.ceil() as u64;
+                } else if needs_reestimate {
+                    totals.exhausted_estimates += 1;
                 } else {
                     totals.unestimated_tasks += 1;
                 }
@@ -232,11 +265,11 @@ impl Catalog {
             let mut blockers = Vec::new();
             for dependency in depends_on {
                 if !matches!(
-                    self.require(*dependency, "task")?.item.fields,
-                    Fields::Task {
+                    self.get(*dependency).map(|other| &other.item.fields),
+                    Ok(Fields::Task {
                         status: WorkStatus::Done,
                         ..
-                    }
+                    })
                 ) {
                     blockers.push(*dependency);
                 }
@@ -249,6 +282,7 @@ impl Catalog {
                 actual_seconds,
                 total_actual_seconds,
                 remaining_minutes,
+                needs_reestimate,
             });
         }
         board_tasks.sort_by_key(|row| {
@@ -274,7 +308,7 @@ impl Catalog {
                 _ => {}
             }
         }
-        let inbox = self
+        let inbox: Vec<_> = self
             .entities()
             .filter(|entity| {
                 self.task_open(entity.id)
@@ -325,6 +359,15 @@ impl Catalog {
             now,
             timezone,
         )?;
+        let next_task = crate::workflow::next_task(
+            self,
+            &board_tasks,
+            &inbox,
+            &planning.priorities,
+            &scheduled,
+            now,
+            window,
+        );
         Ok(DayBoard {
             date,
             timezone: timezone.into(),
@@ -332,6 +375,7 @@ impl Catalog {
             as_of: now,
             plan: plan.cloned(),
             tasks: board_tasks,
+            next_task,
             inbox,
             focus_goals,
             scheduled,
@@ -343,6 +387,7 @@ impl Catalog {
             focus_elapsed_seconds,
             totals,
             journal_path: None,
+            snapshot_entities: None,
             planning,
         })
     }

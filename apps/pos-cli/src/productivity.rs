@@ -23,6 +23,9 @@ pub(crate) enum ProductivityAction {
     Roadmap,
     /// Show a daily projection. The default date is today in the selected zone.
     Day {
+        /// Use today's documents, including entries backfilled after this date.
+        #[arg(long)]
+        latest: bool,
         #[arg(long)]
         date: Option<Date>,
         #[arg(long, default_value = DEFAULT_ZONE)]
@@ -61,13 +64,21 @@ pub(crate) fn run(root: PathBuf, action: ProductivityAction) -> Result<(), Box<d
         }
         ProductivityAction::Show { id } => emit(engine.catalog()?.get(id)?),
         ProductivityAction::Roadmap => emit(&engine.catalog()?.roadmap()),
-        ProductivityAction::Day { date, timezone } => {
+        ProductivityAction::Day {
+            date,
+            timezone,
+            latest,
+        } => {
             let now = Timestamp::now();
             let date = match date {
                 Some(date) => date,
                 None => Productivity::today(&timezone, now)?,
             };
-            emit(&engine.day(date, &timezone, now)?)
+            emit(&if latest {
+                engine.day_latest(date, &timezone, now)?
+            } else {
+                engine.day(date, &timezone, now)?
+            })
         }
         ProductivityAction::Preview {
             request,

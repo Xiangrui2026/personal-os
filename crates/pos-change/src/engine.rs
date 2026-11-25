@@ -76,6 +76,35 @@ impl ChangeEngine {
             .ok_or(ChangeError::NotFound(id))
     }
 
+    /// Materialize the last recorded version per note in a caller-selected history window.
+    pub fn recorded_documents(
+        &self,
+        records: &[ChangeRecord],
+        include: impl Fn(&str) -> bool,
+    ) -> Result<Vec<(String, String)>, ChangeError> {
+        let mut latest = std::collections::BTreeMap::<&str, &ChangeRecord>::new();
+        for record in records {
+            let slot = latest.entry(&record.plan.note_id).or_insert(record);
+            if record.seq > slot.seq {
+                *slot = record;
+            }
+        }
+        if latest.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.read_store()?;
+        latest
+            .into_values()
+            .filter(|record| record.plan.after_exists && include(&record.plan.request.path))
+            .map(|record| {
+                Ok((
+                    record.plan.request.path.clone(),
+                    store.blob(&record.plan.after_hash)?,
+                ))
+            })
+            .collect()
+    }
+
     pub fn diff(&self, id: Uuid) -> Result<String, ChangeError> {
         let store = self.read_store()?;
         let record = store.record(id)?.ok_or(ChangeError::NotFound(id))?;

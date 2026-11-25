@@ -64,6 +64,14 @@ pub struct Checkpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FocusSession {
+    pub id: Uuid,
+    pub intervals: Vec<Interval>,
+    pub status: EntryStatus,
+    pub running_since: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Disposition {
     Move { date: Date },
@@ -126,6 +134,8 @@ pub enum Fields {
         importance: Option<u8>,
         #[serde(default)]
         checkpoints: Vec<Checkpoint>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        focus_sessions: Vec<FocusSession>,
         #[serde(default)]
         outcome: Option<String>,
         #[serde(default)]
@@ -228,6 +238,16 @@ pub struct Entity {
     pub path: String,
     #[serde(flatten)]
     pub item: Item,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TaskProgress>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TaskProgress {
+    pub tasks: usize,
+    pub completed: usize,
+    pub checkpoints: usize,
+    pub checked: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -245,6 +265,10 @@ pub enum Action {
     SetTaskStatus {
         id: Uuid,
         status: WorkStatus,
+    },
+    ReestimateRemaining {
+        id: Uuid,
+        minutes: u32,
     },
     SetCheckpoint {
         id: Uuid,

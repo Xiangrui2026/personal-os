@@ -38,6 +38,37 @@ impl Catalog {
                 )));
             }
         }
+        Self::from_items(items)
+    }
+
+    pub(crate) fn from_items(mut items: BTreeMap<Uuid, Entity>) -> Result<Self, ProductivityError> {
+        crate::workflow::roll_up(&mut items);
+        let mut sessions = Vec::new();
+        for owner in items.values() {
+            if let Fields::Task { focus_sessions, .. } = &owner.item.fields {
+                for session in focus_sessions {
+                    sessions.push(Entity {
+                        id: session.id,
+                        path: owner.path.clone(),
+                        progress: None,
+                        item: Item {
+                            title: owner.item.title.clone(),
+                            fields: Fields::TimeEntry {
+                                task: owner.id,
+                                intervals: session.intervals.clone(),
+                                status: session.status,
+                                running_since: session.running_since,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+        for entry in sessions {
+            if items.insert(entry.id, entry).is_some() {
+                return Err(invalid("专注记录 ID 重复"));
+            }
+        }
         Ok(Self { items })
     }
 
@@ -183,6 +214,7 @@ impl Catalog {
                 estimate_minutes,
                 importance,
                 checkpoints,
+                focus_sessions,
                 ..
             } => {
                 let mut titles = BTreeSet::new();
@@ -215,6 +247,52 @@ impl Catalog {
                 }
                 self.all(goals, "goal")?;
                 self.all(depends_on, "task")?;
+                if matches!(status, WorkStatus::Doing | WorkStatus::Done) {
+                    self.require_ready(depends_on)?;
+                }
+                if *status == WorkStatus::Done && checkpoints.iter().any(|point| !point.done) {
+                    return Err(invalid("请先完成剩余检查点"));
+                }
+                if *status != WorkStatus::Done
+                    && matches!(
+                        existing.map(|old| &old.item.fields),
+                        Some(Fields::Task {
+                            status: WorkStatus::Done,
+                            ..
+                        })
+                    )
+                    && self.entities().any(|other| {
+                        matches!(&other.item.fields, Fields::Task {
+                        status: WorkStatus::Doing | WorkStatus::Done, depends_on, ..
+                    } if depends_on.contains(&entity.id))
+                    })
+                {
+                    return Err(invalid(
+                        "请先暂停或重新打开已经开工的后续任务，再撤回前置任务",
+                    ));
+                }
+                let mut session_ids = BTreeSet::new();
+                let mut open_sessions = 0;
+                for session in focus_sessions {
+                    if session.id == entity.id
+                        || !session_ids.insert(session.id)
+                        || self
+                            .get(session.id)
+                            .is_ok_and(|old| old.path != entity.path)
+                    {
+                        return Err(invalid("专注记录 ID 重复"));
+                    }
+                    validate_intervals(&session.intervals, session.status, session.running_since)?;
+                    if session.status != EntryStatus::Finished {
+                        open_sessions += 1;
+                        if *status != WorkStatus::Doing
+                            || open_sessions > 1
+                            || self.focus()?.is_some_and(|active| active.id != session.id)
+                        {
+                            return Err(invalid("同一时间只能专注于一项进行中的任务"));
+                        }
+                    }
+                }
                 let mut stack = depends_on.clone();
                 let mut visited = BTreeSet::new();
                 while let Some(id) = stack.pop() {
@@ -236,7 +314,7 @@ impl Catalog {
                     return Err(invalid("an estimate must be positive"));
                 }
                 if !status.is_open() && self.focus()?.is_some_and(|focus|
-                    matches!(focus.item.fields, Fields::TimeEntry { task, .. } if task == entity.id)
+                    focus.path != entity.path && matches!(focus.item.fields, Fields::TimeEntry { task, .. } if task == entity.id)
                 ) {
                     return Err(invalid("finish the open focus session before closing its task"));
                 }
@@ -334,8 +412,11 @@ impl Catalog {
                 running_since,
             } => {
                 let task = self.require(*task, "task")?;
-                if (*status == EntryStatus::Running) != running_since.is_some() {
-                    return Err(invalid("a running session needs a start time"));
+                validate_intervals(intervals, *status, *running_since)?;
+                if *status != EntryStatus::Finished
+                    && let Fields::Task { depends_on, .. } = &task.item.fields
+                {
+                    self.require_ready(depends_on)?;
                 }
                 if *status != EntryStatus::Finished
                     && (!self.task_open(task.id)
@@ -345,17 +426,6 @@ impl Catalog {
                         "focus requires an open task and a single active session",
                     ));
                 }
-                for interval in intervals {
-                    interval_valid(*interval)?;
-                }
-                if intervals.windows(2).any(|pair| pair[0].end > pair[1].start)
-                    || intervals
-                        .last()
-                        .zip(*running_since)
-                        .is_some_and(|(last, start)| last.end > start)
-                {
-                    return Err(invalid("time-entry intervals must be ordered and disjoint"));
-                }
             }
         }
         Ok(())
@@ -364,6 +434,44 @@ impl Catalog {
     pub(crate) fn task_open(&self, id: Uuid) -> bool {
         matches!(self.get(id).map(|item| &item.item.fields), Ok(Fields::Task { status, .. }) if status.is_open())
     }
+
+    fn require_ready(&self, depends_on: &[Uuid]) -> Result<(), ProductivityError> {
+        for id in depends_on {
+            let task = self.require(*id, "task")?;
+            if !matches!(
+                task.item.fields,
+                Fields::Task {
+                    status: WorkStatus::Done,
+                    ..
+                }
+            ) {
+                return Err(invalid(format!("前置任务尚未完成：{}", task.item.title)));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_intervals(
+    intervals: &[Interval],
+    status: EntryStatus,
+    running_since: Option<jiff::Timestamp>,
+) -> Result<(), ProductivityError> {
+    if (status == EntryStatus::Running) != running_since.is_some() {
+        return Err(invalid("a running session needs a start time"));
+    }
+    for interval in intervals {
+        interval_valid(*interval)?;
+    }
+    if intervals.windows(2).any(|pair| pair[0].end > pair[1].start)
+        || intervals
+            .last()
+            .zip(running_since)
+            .is_some_and(|(last, start)| last.end > start)
+    {
+        return Err(invalid("time-entry intervals must be ordered and disjoint"));
+    }
+    Ok(())
 }
 
 pub(crate) fn from_note(note: &Note) -> Result<Option<Entity>, ProductivityError> {
@@ -392,13 +500,14 @@ pub(crate) fn from_note(note: &Note) -> Result<Option<Entity>, ProductivityError
         )));
     }
     Ok(Some(Entity {
+        progress: None,
         id,
         path: note.metadata.path.clone(),
         item: doc.item,
     }))
 }
 
-fn managed_path(path: &str) -> bool {
+pub(crate) fn managed_path(path: &str) -> bool {
     ["Life/Goal/", "Life/Project/", "Life/Plan/", "Journal/"]
         .iter()
         .any(|prefix| path.starts_with(prefix))

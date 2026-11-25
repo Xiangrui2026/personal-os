@@ -60,6 +60,7 @@ fn task_fields(project: Option<Uuid>, depends_on: Vec<Uuid>) -> Fields {
         category: None,
         importance: None,
         checkpoints: Vec::new(),
+        focus_sessions: Vec::new(),
         outcome: None,
         exclude_from_estimates: false,
     }
@@ -295,7 +296,7 @@ fn roadmap_day_and_carry_over_reference_one_task() {
         },
         at(),
     );
-    let board = service.day(date, "Asia/Shanghai", at()).unwrap();
+    let board = service.day_latest(date, "Asia/Shanghai", at()).unwrap();
     assert_eq!(board.tasks[0].task.id, task);
     assert!(board.tasks[0].priority);
     assert_eq!(board.focus_goals[0].current_milestone, Some(milestone));
@@ -355,9 +356,11 @@ fn focus_is_persistent_and_a_stale_start_cannot_create_a_second_session() {
             start,
         )
         .unwrap();
+    let stale_target = directory.path().join(&stale.request.path);
+    let before = fs::read(&stale_target).unwrap();
     let focus = submit(&service, Action::FocusStart { task }, start);
     assert!(service.apply(&stale, &ExclusiveWrite::confirmed()).is_err());
-    assert!(!directory.path().join(&stale.request.path).exists());
+    assert_eq!(fs::read(stale_target).unwrap(), before);
     submit(&service, Action::FocusPause, pause);
     let reopened = Productivity::open(directory.path()).unwrap();
     assert_eq!(
@@ -412,7 +415,7 @@ fn day_clips_intervals_and_counts_overlapping_actual_time_once() {
         );
     }
     let board = service
-        .day("2025-11-25".parse().unwrap(), "Asia/Shanghai", at())
+        .day_latest("2025-11-25".parse().unwrap(), "Asia/Shanghai", at())
         .unwrap();
     assert_eq!(board.totals.planned_work_seconds, 1_800);
     assert_eq!(board.totals.fixed_event_seconds, 900);
@@ -471,4 +474,211 @@ fn validates_dependencies_preserves_body_and_updates_through_change() {
             ..
         }
     ));
+}
+
+#[test]
+fn focus_checkpoints_unlock_the_successor_and_roll_up_in_one_change() {
+    let (directory, service) = fixture();
+    let date = Productivity::today("Asia/Shanghai", at()).unwrap();
+    let goal = create(
+        &service,
+        "Publish",
+        Fields::Goal {
+            status: WorkStatus::Doing,
+        },
+    );
+    let milestone = create(
+        &service,
+        "Draft",
+        serde_json::from_value(serde_json::json!({
+            "type":"milestone","goal":goal,"sequence":1,"exit_criteria":["Reviewed"]
+        }))
+        .unwrap(),
+    );
+    let project = create(
+        &service,
+        "Paper",
+        serde_json::from_value(serde_json::json!({
+            "type":"project","goals":[goal]
+        }))
+        .unwrap(),
+    );
+    let first = create(&service, "Outline", serde_json::from_value(serde_json::json!({
+        "type":"task","goals":[goal],"milestone":milestone,"project":project,
+        "checkpoints":[{"title":"Structure"},{"title":"References"}], "initial_estimate_minutes":5
+    })).unwrap());
+    let next = create(&service, "Review", task_fields(None, vec![first]));
+    for task in [first, next] {
+        submit(
+            &service,
+            Action::ScheduleTask {
+                date,
+                task,
+                priority: task == next,
+            },
+            at(),
+        );
+    }
+    for action in [
+        Action::FocusStart { task: next },
+        Action::SetTaskStatus {
+            id: next,
+            status: WorkStatus::Done,
+        },
+        Action::SetTaskStatus {
+            id: first,
+            status: WorkStatus::Done,
+        },
+    ] {
+        assert!(service.preview(action, "test", None, at()).is_err());
+    }
+    let checkpoint = |title: &str, done| Action::SetCheckpoint {
+        id: first,
+        title: title.into(),
+        done,
+    };
+    submit(&service, Action::FocusStart { task: first }, at());
+    submit(&service, checkpoint("Structure", true), at());
+    let end = clock("2025-11-26T10:06:00+08:00");
+    let in_progress = service.day(date, "Asia/Shanghai", end).unwrap();
+    let row = in_progress
+        .tasks
+        .iter()
+        .find(|row| row.task.id == first)
+        .unwrap();
+    assert!(matches!(
+        row.task.item.fields,
+        Fields::Task {
+            status: WorkStatus::Doing,
+            ..
+        }
+    ));
+    assert!(row.needs_reestimate);
+    assert_eq!(row.remaining_minutes, None);
+    assert_eq!(in_progress.planning.workload_ratio, None);
+    assert_eq!(in_progress.next_task, Some(first));
+    submit(
+        &service,
+        Action::ReestimateRemaining {
+            id: first,
+            minutes: 10,
+        },
+        end,
+    );
+    let revised = service.day(date, "Asia/Shanghai", end).unwrap();
+    let row = revised
+        .tasks
+        .iter()
+        .find(|row| row.task.id == first)
+        .unwrap();
+    assert_eq!(row.remaining_minutes, Some(10.0));
+    assert!(!row.needs_reestimate);
+    assert!(matches!(
+        row.task.item.fields,
+        Fields::Task {
+            initial_estimate_minutes: Some(5),
+            estimate_minutes: Some(16),
+            ..
+        }
+    ));
+    let changes = ChangeEngine::open(directory.path()).unwrap();
+    let count = changes.list().unwrap().len();
+    submit(&service, checkpoint("References", true), end);
+    assert_eq!(changes.list().unwrap().len(), count + 1);
+    let board = service.day(date, "Asia/Shanghai", end).unwrap();
+    assert_eq!(board.next_task, Some(next));
+    assert!(board.focus.is_none());
+    assert_eq!(board.totals.actual_seconds, 360);
+    assert_eq!(board.totals.completed, 1);
+    for parent in [project, milestone, goal] {
+        let catalog = service.catalog().unwrap();
+        let progress = catalog.get(parent).unwrap().progress.as_ref().unwrap();
+        assert_eq!(
+            (
+                progress.tasks,
+                progress.completed,
+                progress.checkpoints,
+                progress.checked
+            ),
+            (1, 1, 2, 2)
+        );
+    }
+    let approved = service
+        .preview(Action::FocusStart { task: next }, "test", None, end)
+        .unwrap();
+    submit(&service, checkpoint("References", false), end);
+    assert!(
+        service
+            .apply(&approved, &ExclusiveWrite::confirmed())
+            .is_err()
+    );
+    assert!(service.catalog().unwrap().focus().unwrap().is_none());
+}
+
+#[test]
+fn historical_projection_uses_only_versions_recorded_before_cutoff() {
+    let (directory, service) = fixture();
+    let date = Productivity::today("Asia/Shanghai", at()).unwrap();
+    let task = create(
+        &service,
+        "Before",
+        serde_json::from_value(serde_json::json!({
+            "type":"task","checkpoints":[{"title":"First"},{"title":"Last"}]
+        }))
+        .unwrap(),
+    );
+    submit(
+        &service,
+        Action::ScheduleTask {
+            date,
+            task,
+            priority: true,
+        },
+        at(),
+    );
+    submit(
+        &service,
+        Action::SetCheckpoint {
+            id: task,
+            title: "First".into(),
+            done: true,
+        },
+        at(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let completion = submit(
+        &service,
+        Action::SetCheckpoint {
+            id: task,
+            title: "Last".into(),
+            done: true,
+        },
+        at(),
+    );
+    let cutoff = ChangeEngine::open(directory.path())
+        .unwrap()
+        .show(completion)
+        .unwrap()
+        .executed_unix_ms;
+    let snapshot = service
+        .day_as_of(
+            date,
+            "Asia/Shanghai",
+            Timestamp::from_millisecond(cutoff).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert!(
+        matches!(&snapshot.tasks[0].task.item.fields, Fields::Task { status: WorkStatus::Doing,checkpoints,.. }
+        if checkpoints.iter().filter(|p| p.done).count() == 1)
+    );
+    assert_eq!(snapshot.totals.completed, 0);
+    assert_eq!(
+        service
+            .day_latest(date, "Asia/Shanghai", at())
+            .unwrap()
+            .totals
+            .completed,
+        1
+    );
 }

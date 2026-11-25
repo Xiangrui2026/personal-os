@@ -25,6 +25,7 @@ async fn read<T: Send + 'static>(
 pub(crate) async fn day(
     root: PathBuf,
     date: Option<Date>,
+    latest: Option<bool>,
     timezone: String,
 ) -> Result<DayBoard, String> {
     read(root, move |engine| {
@@ -33,7 +34,11 @@ pub(crate) async fn day(
             Some(date) => date,
             None => Productivity::today(&timezone, now)?,
         };
-        engine.day(date, &timezone, now)
+        if latest.unwrap_or(false) {
+            engine.day_latest(date, &timezone, now)
+        } else {
+            engine.day(date, &timezone, now)
+        }
     })
     .await
 }

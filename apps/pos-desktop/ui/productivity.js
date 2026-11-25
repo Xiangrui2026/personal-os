@@ -96,6 +96,12 @@
         e('summary', {}, 'Vault 连接'), connect);
       host.replaceChildren(notice, content, connection);
       view.connection = connection;
+      const refresh = setInterval(() => {
+        if (!host.isConnected) { clearInterval(refresh); return; }
+        if (document.visibilityState === 'visible' && view.board?.date === nowDate(settings.zone)
+            && !host.querySelector('dialog[open], .day-task-options[open], .day-checkpoints[open], .day-settings[open]')
+            && !view.connection.open && !view.loading) load(view, true);
+      }, 60000);
     } else host.replaceChildren(connect, notice, content);
     connect.addEventListener('submit', event => {
       event.preventDefault();
@@ -116,19 +122,22 @@
     view.notice.textContent = String(error?.message || error);
   }
 
-  async function load(view) {
+  async function load(view, quiet = false) {
     const version = ++view.version;
+    view.loading = true;
     view.notice.textContent = '';
-    view.content.replaceChildren(message('正在读取 Vault…'));
+    if (!quiet) view.content.replaceChildren(message('正在读取 Vault…'));
     const root = settings.root;
     view.root = root;
     try {
+      const latest = view.latestDate === settings.date && Boolean(settings.date);
+      const historical = view.page === 'day' && settings.date && settings.date < nowDate(settings.zone) && !latest;
       const data = view.page === 'day'
-        ? invoke('day', { root, date: settings.date, timezone: settings.zone })
+        ? invoke('day', { root, date: settings.date, timezone: settings.zone, latest })
         : view.page === 'roadmap' ? invoke('roadmap', { root }) : Promise.resolve(null);
-      const [entries, result] = await Promise.all([invoke('entities', { root }), data]);
-      if (!view.host.isConnected || view.version !== version) return;
-      view.entries = entries;
+      const [entries, result] = await Promise.all([historical ? [] : invoke('entities', { root }), data]);
+      if (!view.host.isConnected || view.version !== version || (quiet && view.host.querySelector('dialog[open]'))) return;
+      view.entries = result?.snapshot_entities ?? entries;
       view.content.replaceChildren();
       if (view.page === 'day') {
         view.connection.open = false;
@@ -142,23 +151,45 @@
       }
     } catch (error) {
       if (view.version !== version) return;
-      view.content.replaceChildren();
+      if (!quiet) view.content.replaceChildren();
       report(view, error);
+    } finally {
+      if (view.version === version) view.loading = false;
     }
   }
 
   function renderDay(view, board) {
     window.PosDayBoard.render(view, board, {
-      e, action, message, list, row, section, edit, load, closeDay, focus, preview,
+      e, action, message, list, row, section, edit, load, closeDay, focus, preview, reestimate,
       nowDate, timeText, statuses, settings,
     });
   }
 
+  function reestimate(view, task) {
+    formDialog(view, '重新估算 · ' + task.title, [
+      input('minutes', '从现在起还需要多少分钟？', '', { type: 'number', min: 1, max: 4294967295, step: 1, required: true }),
+      input('reason', '调整原因（可选）'),
+    ], '预览变更', async form => {
+      const plan = await invoke('preview', { root: view.root,
+        action: { action: 'reestimate_remaining', id: task.id, minutes: Number(form.get('minutes')) },
+        reason: String(form.get('reason') || '').trim() || null });
+      return () => confirm(view, plan);
+    });
+  }
+
   function focus(view, board) {
-    if (!board.focus) return message('从任务看板选择一项任务开始专注。');
+    const archived = board.snapshot_entities != null;
+    if (!board.focus) {
+      if (archived) return message('日终时没有进行中的专注。');
+      const next = view.entries.find(item => item.id === board.next_task);
+      if (!next || board.date !== nowDate(settings.zone)) return message('暂无可立即开始的当日任务。');
+      const planned = board.tasks.some(row => row.task.id === next.id);
+      return row(next.title, planned ? '下一项可执行任务' : '下一项可执行任务 · 来自待安排',
+        [action('开始专注', () => preview(view, { action: 'focus_start', task: next.id }), 'pos-primary')]);
+    }
     const active = board.focus.status === 'running';
     const clock = e('strong', { class: 'pos-timer' }, timerText(board.focus_elapsed_seconds));
-    if (active) {
+    if (active && !archived) {
       const since = Date.now();
       const timer = setInterval(() => {
         if (!clock.isConnected) { clearInterval(timer); return; }
@@ -166,7 +197,7 @@
       }, 1000);
     }
     return e('div', { class: 'pos-focus' }, e('strong', {}, board.focus.title), clock,
-      e('div', { class: 'pos-actions' },
+      !archived && e('div', { class: 'pos-actions' },
         action(active ? '暂停' : '继续', () => preview(view, { action: active ? 'focus_pause' : 'focus_resume' })),
         action('结束计时', () => preview(view, { action: 'focus_stop' })),
       ));
@@ -183,9 +214,10 @@
       view.content.append(section(group.goal.title,
         row(statuses[group.goal.status] || '', null, [action('编辑目标', () => edit(view, 'goal', group.goal))]),
         completion(group.goal.title, stages, '个里程碑'),
+        taskProgress(group.goal),
         list(group.milestones.map(stage => row(stage.sequence + ' · ' + stage.title,
           [stage.id === group.current_milestone ? '当前阶段' : statuses[stage.status], ...stage.exit_criteria].filter(Boolean).join(' · '),
-          [action('编辑', () => edit(view, 'milestone', stage))])), '暂无里程碑'),
+          [taskProgress(stage), action('编辑', () => edit(view, 'milestone', stage))])), '暂无里程碑'),
         group.projects.length ? message('关联项目 · ' + group.projects.map(project => project.title).join('、')) : null,
       ));
     }
@@ -199,6 +231,14 @@
       window.PosDayBoard.meter({ e }, done / items.length, title + '进度'));
   }
 
+  function taskProgress(item) {
+    const p = item.progress;
+    if (!p?.tasks) return null;
+    return e('div', { class: 'day-roadmap-progress' },
+      message(`任务 ${p.completed}/${p.tasks}` + (p.checkpoints ? ` · 检查点 ${p.checked}/${p.checkpoints}` : '')),
+      window.PosDayBoard.meter({ e }, p.completed / p.tasks, item.title + '任务完成率'));
+  }
+
   function renderProjects(view) {
     view.content.append(e('div', { class: 'pos-toolbar' },
       action('新建项目', () => edit(view, 'project'), 'pos-primary'),
@@ -208,8 +248,7 @@
       view.content.append(section(kind === 'project' ? '项目' : '任务',
         list(view.entries.filter(item => item.type === kind).map(item => e('div', {},
           row(item.title, statuses[item.status], [action('编辑', () => edit(view, kind, item))]),
-          kind === 'project' ? completion(item.title, view.entries.filter(task => task.type === 'task'
-            && task.project === item.id && task.status !== 'cancelled'), '项任务') : null)),
+          kind === 'project' ? taskProgress(item) : null)),
         kind === 'project' ? '暂无项目' : '暂无任务')));
     }
   }
@@ -263,6 +302,8 @@
     const numeric = (name, label, value, minimum = 0) => input(name, label, value ?? '', { type: 'number', min: minimum, max: 4294967295, step: 1 });
     const status = () => choice('status', '状态', Object.entries(statuses), current.status || 'todo', true);
     const interval = current.interval || current.intervals?.[0];
+    const sessionOwner = kind === 'time_entry' && existing
+      ? view.entries.find(item => item.id === current.task && item.path === current.path) : null;
     const currentWindows = current.work_windows?.map(interval => {
       const start = timeText(interval.start, settings.zone, true);
       const end = timeText(interval.end, settings.zone, true);
@@ -270,7 +311,7 @@
     });
     const checkbox = (name, label, checked) => e('label', { class: 'pos-check' },
       e('input', { type: 'checkbox', name, checked }), e('span', {}, label));
-    const controls = [input('title', '标题', current.title || (kind === 'daily_plan' ? '日计划 ' + day : ''), { required: true })];
+    const controls = [input('title', '标题', current.title || (kind === 'daily_plan' ? '日计划 ' + day : ''), { required: true, readonly: Boolean(sessionOwner) })];
     if (['goal', 'milestone', 'project', 'task'].includes(kind)) controls.push(status());
     if (kind === 'milestone') controls.push(reference('goal', '所属目标', 'goal', true),
       numeric('sequence', '阶段顺序', current.sequence ?? 1, 1),
@@ -297,7 +338,7 @@
       checkbox('configure_windows', '明确配置当天可工作时段（日休可留空）', current.work_windows != null),
       field('可工作时段（每行一段）', e('textarea', { name: 'work_windows', rows: 3, placeholder: '09:00-12:00\n14:00-18:00' },
         currentWindows?.join('\n') || '')));
-    if (kind === 'time_block' || kind === 'time_entry') controls.push(reference('task', '关联任务', 'task', true));
+    if ((kind === 'time_block' || kind === 'time_entry') && !sessionOwner) controls.push(reference('task', '关联任务', 'task', true));
     if (['event', 'time_block', 'time_entry'].includes(kind)) {
       controls.push(input('start', '开始', interval ? timeText(interval.start, settings.zone, true) : day + 'T09:00', { type: 'datetime-local', required: true }),
         input('end', '结束', interval ? timeText(interval.end, settings.zone, true) : day + 'T10:00', { type: 'datetime-local', required: true }));
@@ -347,7 +388,7 @@
           })) : null });
       if (['event', 'time_block', 'time_entry'].includes(kind)) {
         const times = { start: await instant('start'), end: await instant('end') };
-        if (kind === 'time_entry') Object.assign(item, { task: value('task'), intervals: [times], status: 'finished' });
+        if (kind === 'time_entry') Object.assign(item, { task: sessionOwner?.id ?? value('task'), intervals: [times], status: 'finished' });
         else Object.assign(item, { interval: times, ...(kind === 'time_block' ? { task: value('task') } : {}) });
       }
       const command = existing ? { action: 'edit', id: existing.id, item } : { action: 'create', item };
@@ -389,11 +430,24 @@
       report(view, '预览已生成。应用变更前需在获准的 Vault 初始化 Change 版本库。');
       return;
     }
+    const item = plan.request.operation.payload?.value;
+    const previous = view.entries.find(entry => entry.path === plan.request.path && entry.type === 'task');
+    const effects = [];
+    if (item?.type === 'task' && previous) {
+      if (previous.status !== item.status) effects.push('任务状态将变为' + statuses[item.status]);
+      const checked = task => (task.checkpoints || []).filter(point => point.done).length;
+      if (checked(previous) !== checked(item)) effects.push(`检查点将完成 ${checked(item)} / ${item.checkpoints.length} 项`);
+      const active = task => (task.focus_sessions || []).find(session => session.status !== 'finished')?.status;
+      if (active(previous) !== active(item)) effects.push(({ running: '开始或继续专注计时', paused: '暂停专注计时' })[active(item)] || '结束专注并保存用时');
+      if (item.estimate_minutes != null && previous.estimate_minutes !== item.estimate_minutes) effects.push('总估时将更新为 ' + item.estimate_minutes + ' 分钟');
+    }
+    const diff = e('div', { class: 'pos-diff' },
+      e('pre', {}, plan.patch.before || '（新建）'),
+      e('pre', {}, plan.patch.after || '（空）'));
     formDialog(view, '确认变更', [
+      effects.length ? e('div', {}, e('strong', {}, item.title), list(effects)) : null,
       e('p', {}, plan.request.path),
-      e('div', { class: 'pos-diff' },
-        e('pre', {}, plan.patch.before || '（新建）'),
-        e('pre', {}, plan.patch.after || '（空）')),
+      effects.length ? e('details', {}, e('summary', {}, '查看文件变更'), diff) : diff,
       e('label', { class: 'pos-check' }, e('input', { type: 'checkbox', name: 'exclusive', required: true }),
         e('span', {}, '我确认写入此文件，并已暂停其他会修改它的程序。')),
     ], '应用变更', async form => {

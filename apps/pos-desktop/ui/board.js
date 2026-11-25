@@ -7,6 +7,8 @@
   function render(view, board, ui) {
     const { e, action, message, edit, load, closeDay, settings } = ui;
     const today = ui.nowDate(board.timezone) === board.date;
+    const past = board.date < ui.nowDate(board.timezone);
+    const archived = board.snapshot_entities != null;
     const closed = board.plan?.closing != null;
     const date = e('input', { type: 'date', value: board.date, 'aria-label': '看板日期' });
     date.onchange = () => { if (date.value) { settings.date = date.value; load(view); } };
@@ -22,15 +24,19 @@
     const hero = e('header', { class: 'day-hero' },
       e('div', {}, e('p', { class: 'day-date' }, `${dateTitle} · ${board.date.slice(0, 4)}`),
         e('h1', { id: 'page-title' }, '每日看板'),
-        e('p', { class: 'day-state' }, closed ? '当日已结案' : today ? '今天' : '查看所选日期')),
+        e('p', { class: 'day-state' }, archived ? '日终快照 · 仅含当时已记录的变更' : past ? '最新记录 · 含事后补录' : closed ? '当日已结案' : today ? '今天' : '查看所选日期')),
       e('div', { class: 'day-hero-controls' },
         e('div', { class: 'day-date-controls' },
           arrow(ui, '‹', '前一天', () => changeDate(-1)), date,
           arrow(ui, '›', '后一天', () => changeDate(1)),
           action('今天', () => { settings.date = null; load(view); })),
         e('div', { class: 'day-date-controls' },
-          action('编辑日计划', () => edit(view, 'daily_plan', board.plan)),
-          action('新建任务', () => edit(view, 'task'), 'pos-primary'))));
+          past && action(archived ? '查看事后补录' : '回到日终快照', () => {
+            view.latestDate = archived ? board.date : null;
+            load(view);
+          }),
+          !archived && action('编辑日计划', () => edit(view, 'daily_plan', board.plan)),
+          !archived && action('新建任务', () => edit(view, 'task'), 'pos-primary'))));
     const { totals, planning } = board;
     const summary = e('div', { class: 'day-metrics' },
       metric(ui, '任务完成', `${totals.completed} / ${totals.tasks}`,
@@ -40,7 +46,7 @@
         '固定日程 ' + rounded(totals.fixed_event_seconds / 60)),
       metric(ui, '实际投入', rounded(totals.actual_seconds / 60),
         totals.actual_seconds ? '区间已去重' : '当天暂无记录'),
-      metric(ui, '剩余工作负荷', ratio(planning.workload_ratio),
+      metric(ui, '剩余工作负荷', totals.exhausted_estimates ? '待重估' : ratio(planning.workload_ratio),
         planning.remaining_work_minutes != null
           ? '已估 ' + rounded(totals.remaining_estimate_minutes) + ' · 可用 ' + rounded(planning.remaining_work_minutes)
           : '设置可工作时段后计算',
@@ -70,7 +76,7 @@
       e('div', { class: 'day-view-controls' }, tabs,
         e('details', { class: 'day-settings' }, e('summary', {}, '看板设置'),
           e('div', { class: 'pos-toolbar' }, zone, action('刷新', () => load(view)),
-            closed ? message('当日已结案') : action('结束一天', () => closeDay(view))))), content);
+            !archived && (closed ? message('当日已结案') : action('结束一天', () => closeDay(view)))))), content);
     show(view.dayTab || 'work');
   }
 
@@ -98,16 +104,22 @@
   function execution(view, board, ui) {
     const { e, action, preview, edit, list, message, row, section } = ui;
     const closed = board.plan?.closing != null;
+    const archived = board.snapshot_entities != null;
     const priorities = board.tasks.filter(item => item.priority);
     const planning = e('aside', { class: 'day-stack' },
       section('今日重点', list(priorities.map(({ task }) => row(task.title, ui.statuses[task.status])), '暂无重点任务')),
-      section('目标方向', list(board.focus_goals.map(group => row(group.goal.title,
-        group.milestones.find(stage => stage.id === group.current_milestone)?.title)), '暂无重点目标')),
+      section('目标方向', list(board.focus_goals.map(group => {
+        const stage = group.milestones.find(stage => stage.id === group.current_milestone);
+        const progress = group.goal.progress;
+        return row(group.goal.title, [stage?.title,
+          progress ? `任务 ${progress.completed}/${progress.tasks}` : null,
+          progress?.checkpoints ? `检查点 ${progress.checked}/${progress.checkpoints}` : null].filter(Boolean).join(' · '));
+      }), '暂无重点目标')),
       section('待安排', e('details', { class: 'day-inbox', open: board.inbox.length <= 4 },
         e('summary', {}, `${board.inbox.length} 项任务`), list(board.inbox.map(task => row(task.title, task.category,
-          [closed ? null : action('排入当天', () => preview(view, {
+          [closed || archived ? null : action('排入当天', () => preview(view, {
             action: 'schedule_task', date: board.date, task: task.id,
-          })), action('编辑', () => edit(view, 'task', task))])), '待安排清单已清空'))));
+          })), !archived && action('编辑', () => edit(view, 'task', task))])), '待安排清单已清空'))));
     const lanes = Object.entries(ui.statuses).map(([status, label]) => {
       const entries = board.tasks.filter(item => item.task.status === status);
       return { status, label, entries };
@@ -126,6 +138,10 @@
       warnings.push('剩余已估工作超出可用时间 ' + rounded(board.totals.remaining_estimate_minutes - capacity));
     }
     if (board.totals.unestimated_tasks) warnings.push(`${board.totals.unestimated_tasks} 项待执行任务缺少耗时估算`);
+    for (const { task } of board.tasks.filter(row => row.needs_reestimate)) {
+      warnings.push(row(task.title, '已用完估时，剩余工作量待重估',
+        archived ? [] : [action('重估剩余时间', () => ui.reestimate(view, task))]));
+    }
     const overdue = board.planning.priorities.filter(item => item.overdue).length;
     if (overdue) warnings.push(`${overdue} 项任务已超过截止时间或安排时点`);
     const outcomeItems = board.tasks.filter(({ task }) => task.status === 'done');
@@ -141,10 +157,13 @@
   function taskCard(view, board, ui, entry) {
     const { e, action, preview, edit, message } = ui;
     const { task } = entry;
+    const archived = board.snapshot_entities != null;
+    const ready = !archived && !entry.blockers.length && task.status !== 'cancelled';
     const checkpoints = task.checkpoints || [];
     const done = checkpoints.filter(item => item.done).length;
     const options = [];
-    if (isOpen(task) && !board.focus) options.push(action('专注', () => preview(view, { action: 'focus_start', task: task.id })));
+    const canFocus = ready && isOpen(task) && !board.focus && board.date === ui.nowDate(board.timezone);
+    if (canFocus && task.status === 'doing') options.push(action('继续专注', () => preview(view, { action: 'focus_start', task: task.id })));
     if (isOpen(task) && !entry.priority && board.plan?.closing == null) options.push(action('设为重点', () =>
       preview(view, { action: 'schedule_task', date: board.date, task: task.id, priority: true })));
     options.push(action('编辑', () => edit(view, 'task', task)));
@@ -153,7 +172,7 @@
     const metadata = [task.category, entry.priority ? '重点' : null, entry.blockers.length ? '有前置阻塞' : null].filter(Boolean);
     return e('article', { class: 'day-task' },
       metadata.length ? e('div', { class: 'day-tags' }, metadata.map(text => e('span', {}, text))) : null,
-      e('h4', {}, editButton),
+      e('h4', {}, archived ? task.title : editButton),
       entry.blockers.length ? e('p', { class: 'day-blockers' }, entry.blockers.map(id => view.entries.find(item => item.id === id)?.title || id).join('、')) : null,
       checkpoints.length ? e('details', { class: 'day-checkpoints' },
         e('summary', {}, `检查点 ${done}/${checkpoints.length}`),
@@ -161,16 +180,19 @@
           const button = action((item.done ? '✓ ' : '○ ') + item.title, () =>
             preview(view, { action: 'set_checkpoint', id: task.id, title: item.title, done: !item.done }), 'day-checkpoint');
           button.setAttribute('aria-pressed', String(item.done));
+          button.disabled = !ready;
           return e('li', {}, button);
         }))) : message('未拆分检查点'),
       checkpoints.length ? meter(ui, done / checkpoints.length, task.title + '的检查点进度') : null,
       estimate != null || entry.total_actual_seconds ? e('p', { class: 'day-task-time' },
         [estimate == null ? null : '估 ' + rounded(estimate), entry.total_actual_seconds ? '累计 ' + rounded(entry.total_actual_seconds / 60) : null].filter(Boolean).join(' · ')) : null,
       e('footer', {},
-        isOpen(task) ? action(task.status === 'todo' ? '开始' : '完成', () => preview(view, {
+        canFocus && task.status === 'todo' ? action('开始专注', () => preview(view, {
+          action: 'focus_start', task: task.id,
+        }), 'day-status-action') : ready && isOpen(task) && (task.status === 'todo' || !checkpoints.length) ? action(task.status === 'todo' ? '开始' : '完成', () => preview(view, {
           action: 'set_task_status', id: task.id, status: task.status === 'todo' ? 'doing' : 'done',
         }), 'day-status-action') : null,
-        e('details', { class: 'day-task-options' }, e('summary', { 'aria-label': task.title + '的操作' }, '•••'),
+        !archived && e('details', { class: 'day-task-options' }, e('summary', { 'aria-label': task.title + '的操作' }, '•••'),
           e('div', {}, options))));
   }
 
@@ -223,7 +245,7 @@
         lanes[index].end = +new Date(item.end);
         const text = `${clock(item.start)}–${clock(item.end)} · ${item.title}`;
         const entity = kind === 'initial' ? null : view.entries.find(entity => entity.id === item.id);
-        const editable = entity && !['paused', 'running'].includes(entity.status);
+        const editable = board.snapshot_entities == null && entity && !['paused', 'running'].includes(entity.status);
         const block = editable ? action(item.title, () => edit(view, entity.type, entity), 'day-time-block')
           : e('span', { class: 'day-time-block' }, item.title);
         block.dataset.kind = item.kind;
@@ -252,7 +274,7 @@
       track('当前计划', board.scheduled, 'current'),
       track('实际记录', board.actual, 'actual'));
     return e('div', { class: 'day-stack' },
-      section('计划和实际', e('div', { class: 'day-time-tools pos-actions' },
+      section('计划和实际', board.snapshot_entities == null && e('div', { class: 'day-time-tools pos-actions' },
         action('新建日程', () => edit(view, 'event')),
         action('安排时间块', () => edit(view, 'time_block')),
         action('补录用时', () => edit(view, 'time_entry'), 'pos-primary')),
@@ -327,7 +349,7 @@
       model.strategic_target_minutes > 0 ? meter(ui, model.strategic_scheduled_minutes / model.strategic_target_minutes, '战略时间预算') : null,
       model.calibrated_tasks ? message('有同类样本的任务按 P50 调整，其余保留手动估算。') : null,
       board.totals.unestimated_tasks ? message(`${board.totals.unestimated_tasks} 项任务未计入手动估算。`) : null,
-      action('设置工作时段和预算', () => ui.edit(view, 'daily_plan', board.plan)));
+      board.snapshot_entities == null && action('设置工作时段和预算', () => ui.edit(view, 'daily_plan', board.plan)));
     const estimates = Object.entries(model.estimates);
     const estimateTable = e('table', { class: 'day-estimates' },
       e('thead', {}, e('tr', {}, ['类别', '样本', 'P50', 'P80', 'P95'].map(title => e('th', { scope: 'col' }, title)))),

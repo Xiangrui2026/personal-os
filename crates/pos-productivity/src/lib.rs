@@ -4,6 +4,7 @@ mod history;
 mod model;
 mod planning;
 mod service;
+mod workflow;
 
 pub use board::{BoardTask, DayBoard, DayTotals, RoadmapGoal, TimelineItem};
 pub use catalog::Catalog;
