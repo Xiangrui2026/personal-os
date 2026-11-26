@@ -77,6 +77,122 @@ fn note_count(root: &Path) -> usize {
 }
 
 #[test]
+fn daily_agenda_repeats_by_date_and_commits_the_selection_once() {
+    use pos_productivity::{PlanSlot, RoutineStatus};
+    use std::collections::BTreeMap;
+    let (dir, svc) = fixture();
+    let date = "2025-11-26".parse().unwrap();
+    let next = "2025-11-27".parse().unwrap();
+    let start = clock("2025-11-26T09:00:00+08:00");
+    let finish = clock("2025-11-26T12:00:00+08:00");
+    let rule = create(
+        &svc,
+        "Read",
+        Fields::Routine {
+            from: date,
+            until: None,
+            minutes: 30,
+            start: None,
+            goal: None,
+        },
+    );
+    let task = create(&svc, "Draft", task_fields(None, vec![]));
+    let urgent = create(
+        &svc,
+        "Review",
+        serde_json::from_value(serde_json::json!({
+            "type":"task","importance":90,"initial_estimate_minutes":100,"due_at":finish
+        }))
+        .unwrap(),
+    );
+    let before = svc
+        .catalog()
+        .unwrap()
+        .agenda(date, "Asia/Shanghai", start)
+        .unwrap();
+    assert_eq!(before.pool.len(), 2);
+    assert_eq!(before.board.routines.len(), 1);
+    assert!(before.board.plan.is_none());
+    let mut routines = before.board.routines;
+    routines.get_mut(&rule).unwrap().start = Some("11:00".parse().unwrap());
+    let save = Action::SaveAgenda {
+        date,
+        base: None,
+        tasks: vec![task],
+        routines,
+        slots: BTreeMap::from([(
+            task,
+            PlanSlot {
+                start: "09:00".parse().unwrap(),
+                minutes: 60,
+            },
+        )]),
+        budget_minutes: Some(180),
+        work_windows: Some(vec![Interval { start, end: finish }]),
+        buffer_minutes: 10,
+    };
+    let points = svc
+        .agenda_draft(save.clone(), "Asia/Shanghai", start)
+        .unwrap();
+    let point = points.iter().find(|p| p.task == urgent).unwrap();
+    assert_eq!(point.available_minutes, Some(80.0));
+    assert_eq!(point.quadrant, Some(1));
+    assert!(
+        points
+            .iter()
+            .find(|p| p.task == task)
+            .unwrap()
+            .deadline
+            .is_none()
+    );
+    assert!(svc.catalog().unwrap().plan(date).unwrap().is_none());
+    let changes = ChangeEngine::open(dir.path()).unwrap();
+    let count = changes.list().unwrap().len();
+    submit(&svc, save.clone(), start);
+    assert_eq!(changes.list().unwrap().len(), count + 1);
+    assert!(svc.preview(save, "fixture", None, start).is_err());
+    let board = svc.day_latest(date, "Asia/Shanghai", start).unwrap();
+    assert_eq!(board.totals.planned_work_seconds, 90 * 60);
+    assert!(
+        board
+            .tasks
+            .iter()
+            .find(|r| r.task.id == task)
+            .unwrap()
+            .planned
+    );
+    submit(
+        &svc,
+        Action::SetRoutineStatus {
+            date,
+            rule,
+            status: RoutineStatus::Done,
+        },
+        start,
+    );
+    let tomorrow = svc.day_latest(next, "Asia/Shanghai", start).unwrap();
+    assert_eq!(tomorrow.routines[&rule].status, RoutineStatus::Todo);
+    assert!(tomorrow.routines[&rule].start.is_none());
+    assert_eq!(tomorrow.routine_week_done[&rule], 1);
+    submit(
+        &svc,
+        Action::SetRoutineStatus {
+            date: next,
+            rule,
+            status: RoutineStatus::Skipped,
+        },
+        start,
+    );
+    assert_eq!(
+        svc.day_latest(date, "Asia/Shanghai", start)
+            .unwrap()
+            .routines[&rule]
+            .status,
+        RoutineStatus::Done
+    );
+}
+
+#[test]
 fn board_keeps_checkpoints_time_and_original_arrangements_separate() {
     let (_directory, service) = fixture();
     let date = "2025-11-26".parse().unwrap();
@@ -98,6 +214,7 @@ fn board_keeps_checkpoints_time_and_original_arrangements_separate() {
         &service,
         "Plan",
         Fields::DailyPlan {
+            layout: Default::default(),
             date,
             tasks: vec![task],
             priority_tasks: vec![task],

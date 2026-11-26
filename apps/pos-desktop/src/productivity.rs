@@ -44,6 +44,32 @@ pub(crate) async fn day(
 }
 
 #[tauri::command]
+pub(crate) async fn agenda_priorities(
+    root: PathBuf,
+    action: Action,
+    timezone: String,
+) -> Result<Vec<pos_productivity::Priority>, String> {
+    read(root, move |engine| {
+        engine.agenda_draft(action, &timezone, Timestamp::now())
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn agenda(
+    root: PathBuf,
+    date: Option<Date>,
+    timezone: String,
+) -> Result<pos_productivity::Agenda, String> {
+    read(root, move |engine| {
+        let now = Timestamp::now();
+        let date = date.unwrap_or(Productivity::today(&timezone, now)?);
+        engine.catalog()?.agenda(date, &timezone, now)
+    })
+    .await
+}
+
+#[tauri::command]
 pub(crate) async fn roadmap(root: PathBuf) -> Result<Vec<RoadmapGoal>, String> {
     read(root, |engine| Ok(engine.catalog()?.roadmap())).await
 }

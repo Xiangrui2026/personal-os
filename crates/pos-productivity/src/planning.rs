@@ -93,9 +93,15 @@ impl Planning {
             plans.available(from, day.end, None)?
         };
         let estimates = estimate_samples(catalog, now);
-        let mut demand = 0.0;
+        let routine_demand: f64 = catalog
+            .routines(plans.date(day.start), catalog.plan(plans.date(day.start))?)
+            .values()
+            .filter(|r| r.status == RoutineStatus::Todo)
+            .map(|r| f64::from(r.minutes))
+            .sum();
+        let mut demand = routine_demand;
         let mut estimated = 0;
-        let mut calibrated_remaining = 0.0;
+        let mut calibrated_remaining = routine_demand;
         let mut calibrated_tasks = 0;
         let mut missing_calibration = false;
         let mut priorities = Vec::new();
@@ -144,7 +150,7 @@ impl Planning {
             } else {
                 missing_calibration = true;
             }
-            let deadline = plans.deadline(row.task.id, *due_at, *milestone, day.start)?;
+            let deadline = plans.deadline(row.task.id, *due_at, *milestone);
             let overdue = deadline.is_some_and(|(deadline, _)| deadline <= from);
             let available_minutes = match deadline {
                 Some(_) if overdue => Some(0.0),
@@ -302,12 +308,25 @@ impl<'a> WorkCalendar<'a> {
                 start: start.max(midnight),
                 end: end.min(next_midnight),
             };
-            let stops = self
+            let plan = self.plans.get(&date).copied();
+            let routines = self.catalog.routines(date, plan);
+            let extra = self
+                .catalog
+                .agenda_slots(date, &self.zone, plan, &routines)?;
+            let mut stops = self
                 .reservations
                 .iter()
                 .filter(|(owner, _)| owner.is_none() || task.is_some_and(|id| *owner != Some(id)))
                 .map(|(_, interval)| *interval)
                 .collect::<Vec<_>>();
+            if let Some(task) = task {
+                stops.extend(
+                    extra
+                        .iter()
+                        .filter(|slot| slot.task != Some(task))
+                        .map(|slot| slot.interval),
+                );
+            }
             let windows = windows
                 .iter()
                 .filter_map(|window| clip(*window, day))
@@ -334,7 +353,16 @@ impl<'a> WorkCalendar<'a> {
                         - reserved(&windows, future, stops.iter().copied()),
                 )
             });
-            total += (capacity - i64::from(*buffer_minutes) * 60).max(0) as f64 / 60.0;
+            let flexible: i64 = if task.is_some() {
+                routines
+                    .values()
+                    .filter(|r| r.start.is_none() && r.status == RoutineStatus::Todo)
+                    .map(|r| i64::from(r.minutes) * 60)
+                    .sum()
+            } else {
+                0
+            };
+            total += (capacity - flexible - i64::from(*buffer_minutes) * 60).max(0) as f64 / 60.0;
             date = next;
             midnight = next_midnight;
         }
@@ -346,10 +374,9 @@ impl<'a> WorkCalendar<'a> {
         task: Uuid,
         due_at: Option<Timestamp>,
         milestone: Option<Uuid>,
-        day: Timestamp,
-    ) -> Result<Option<(Timestamp, &'static str)>, ProductivityError> {
+    ) -> Option<(Timestamp, &'static str)> {
         if let Some(deadline) = due_at {
-            return Ok(Some((deadline, "task")));
+            return Some((deadline, "task"));
         }
         let stage = milestone
             .and_then(|id| self.catalog.get(id).ok())
@@ -372,31 +399,10 @@ impl<'a> WorkCalendar<'a> {
             })
             .min()
             .map(|deadline| (deadline, "dependency"));
-        let scheduled = self
-            .plans
-            .range(self.date(day)..)
-            .find_map(|(date, plan)| match &plan.item.fields {
-                Fields::DailyPlan {
-                    tasks,
-                    closing: None,
-                    ..
-                } if tasks.contains(&task) => Some(*date),
-                _ => None,
-            })
-            .map(|date| self.midnight(date.tomorrow()?))
-            .transpose()?
-            .map(|deadline| (deadline, "day"));
-        let block = self
-            .reservations
-            .iter()
-            .filter(|(id, interval)| *id == Some(task) && interval.end > day)
-            .map(|(_, interval)| interval.end)
-            .min()
-            .map(|deadline| (deadline, "block"));
-        Ok([stage, downstream, scheduled, block]
+        [stage, downstream]
             .into_iter()
             .flatten()
-            .min_by_key(|(deadline, _)| *deadline))
+            .min_by_key(|(deadline, _)| *deadline)
     }
 }
 

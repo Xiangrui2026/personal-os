@@ -60,9 +60,50 @@ pub(crate) fn attach(catalog: &Catalog, board: &mut DayBoard, mut records: Vec<C
     originals_in_order.sort_by_key(|(seq, _)| *seq);
     for (_, entity) in originals_in_order {
         match &entity.item.fields {
-            Fields::DailyPlan { date, tasks, .. }
-                if *date == board.date && initial.task_titles.is_none() =>
-            {
+            Fields::DailyPlan {
+                date,
+                tasks,
+                layout,
+                ..
+            } if *date == board.date && initial.task_titles.is_none() => {
+                if let Ok(zone) = jiff::tz::TimeZone::get(&board.timezone) {
+                    for (id, slot) in &layout.slots {
+                        if let Ok(interval) = crate::agenda::slot_interval(*date, &zone, *slot)
+                            && let Some(task) = originals
+                                .get(id)
+                                .map(|(_, entity)| entity)
+                                .or_else(|| catalog.get(*id).ok())
+                        {
+                            initial.scheduled.push(timeline(
+                                task,
+                                "plan_slot",
+                                Some(*id),
+                                interval,
+                            ));
+                        }
+                    }
+                    for (&id, routine) in &layout.routines {
+                        if let Some(start) = routine.start
+                            && routine.status != RoutineStatus::Skipped
+                            && let Ok(interval) = crate::agenda::slot_interval(
+                                *date,
+                                &zone,
+                                PlanSlot {
+                                    start,
+                                    minutes: routine.minutes,
+                                },
+                            )
+                        {
+                            initial.scheduled.push(crate::TimelineItem {
+                                id,
+                                title: routine.title.clone(),
+                                kind: "routine",
+                                task: None,
+                                interval,
+                            });
+                        }
+                    }
+                }
                 initial.task_titles = Some(
                     tasks
                         .iter()

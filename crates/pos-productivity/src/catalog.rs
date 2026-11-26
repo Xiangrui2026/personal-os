@@ -10,6 +10,9 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    pub(crate) fn overlay_plan(&mut self, entity: Entity) {
+        self.items.insert(entity.id, entity);
+    }
     pub fn load(vault: &Vault) -> Result<Self, ProductivityError> {
         let index = vault.scan()?;
         if let Some(issue) = index.report()?.issues.into_iter().find(|issue| {
@@ -143,6 +146,9 @@ impl Catalog {
         tasks.extend(decisions.into_iter().filter_map(|(id, (_, decision))| {
             matches!(decision, Disposition::Move { date: target } if *target == date).then_some(id)
         }));
+        if let Some(Fields::DailyPlan { layout, .. }) = plan.map(|plan| &plan.item.fields) {
+            tasks.retain(|id| !layout.omitted.contains(id));
+        }
         tasks
     }
 
@@ -190,6 +196,21 @@ impl Catalog {
             return Err(invalid("an edit must keep the entity path and type"));
         }
         match &entity.item.fields {
+            Fields::Routine {
+                from,
+                until,
+                minutes,
+                start,
+                goal,
+            } => {
+                crate::agenda::validate_duration(*minutes, *start)?;
+                if until.is_some_and(|end| end < *from) {
+                    return Err(invalid("结束日期早于起始日期"));
+                }
+                if let Some(id) = goal {
+                    self.require(*id, "goal")?;
+                }
+            }
             Fields::Goal { .. } => {}
             Fields::Milestone { goal, sequence, .. } => {
                 self.require(*goal, "goal")?;
@@ -321,6 +342,7 @@ impl Catalog {
             }
             Fields::DailyPlan {
                 date,
+                layout,
                 tasks,
                 priority_tasks,
                 focus_goals,
@@ -340,6 +362,18 @@ impl Catalog {
                     ));
                 }
                 self.all(tasks, "task")?;
+                for (id, slot) in &layout.slots {
+                    if !tasks.contains(id) {
+                        return Err(invalid("定时任务必须在当天计划中"));
+                    }
+                    crate::agenda::validate_duration(slot.minutes, Some(slot.start))?;
+                }
+                for occurrence in layout.routines.values() {
+                    crate::agenda::validate_duration(occurrence.minutes, occurrence.start)?;
+                }
+                if tasks.iter().any(|id| layout.omitted.contains(id)) {
+                    return Err(invalid("任务同时被选入和移出"));
+                }
                 self.all(priority_tasks, "task")?;
                 self.all(focus_goals, "goal")?;
                 if priority_tasks.iter().any(|id| !tasks.contains(id)) {

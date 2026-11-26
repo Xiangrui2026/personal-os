@@ -150,7 +150,18 @@
       section('任务产出', list(outcomeItems.map(({ task }) =>
         row(task.title, task.outcome || '尚未填写产出')), '当天看板暂无已完成任务')),
       section('时间分布', distribution(board, ui)));
-    const center = e('div', { class: 'day-stack' }, section('专注计时', ui.focus(view, board)), work);
+    const occurrences = Object.entries(board.routines || {});
+    const routines = occurrences.length ? section('每日固定任务', list(occurrences.map(([id,r])=>e('div',{},row(r.title,
+      [r.start?.slice(0,5), r.minutes+' 分钟', {todo:'待完成',done:'已完成',skipped:'已跳过'}[r.status],
+        '近 7 天完成 '+(board.routine_week_done[id] || 0)+' 天'].filter(Boolean).join(' · '),
+      archived || closed ? [] : (r.status==='todo'?[['done','完成'],['skipped','跳过']]:[['todo','恢复']])
+        .map(([status,label])=>action(label,()=>preview(view,{action:'set_routine_status',date:board.date,rule:id,status})))),
+      e('div',{class:'routine-week','aria-label':'近七天，由早到晚'},(board.routine_week?.[id] || Array(7).fill(null)).map((state,i)=>{
+        const date=new Date(board.date+'T12:00:00Z');date.setUTCDate(date.getUTCDate()+i-6);
+        const label=date.toISOString().slice(0,10)+' · '+({done:'已完成',skipped:'已跳过',todo:'待完成'}[state] || '无记录');
+        return e('span',{'data-state':state || 'empty',title:label,'aria-label':label});
+      })))))) : null;
+    const center = e('div', { class: 'day-stack' }, section('专注计时', ui.focus(view, board)), routines, work);
     return e('div', { class: 'day-execution' }, planning, center, right);
   }
 
@@ -245,7 +256,7 @@
         lanes[index].end = +new Date(item.end);
         const text = `${clock(item.start)}–${clock(item.end)} · ${item.title}`;
         const entity = kind === 'initial' ? null : view.entries.find(entity => entity.id === item.id);
-        const editable = board.snapshot_entities == null && entity && !['paused', 'running'].includes(entity.status);
+        const editable = board.snapshot_entities == null && entity && !['routine','plan_slot'].includes(item.kind) && !['paused', 'running'].includes(entity.status);
         const block = editable ? action(item.title, () => edit(view, entity.type, entity), 'day-time-block')
           : e('span', { class: 'day-time-block' }, item.title);
         block.dataset.kind = item.kind;

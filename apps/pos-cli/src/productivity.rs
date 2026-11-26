@@ -21,6 +21,12 @@ pub(crate) enum ProductivityAction {
         id: Uuid,
     },
     Roadmap,
+    Agenda {
+        #[arg(long)]
+        date: Option<Date>,
+        #[arg(long, default_value = DEFAULT_ZONE)]
+        timezone: String,
+    },
     /// Show a daily projection. The default date is today in the selected zone.
     Day {
         /// Use today's documents, including entries backfilled after this date.
@@ -50,6 +56,14 @@ pub(crate) enum ProductivityAction {
 pub(crate) fn run(root: PathBuf, action: ProductivityAction) -> Result<(), Box<dyn Error>> {
     let engine = Productivity::open(root)?;
     match action {
+        ProductivityAction::Agenda { date, timezone } => {
+            let now = Timestamp::now();
+            emit(&engine.catalog()?.agenda(
+                date.unwrap_or(Productivity::today(&timezone, now)?),
+                &timezone,
+                now,
+            )?)
+        }
         ProductivityAction::List { kind } => {
             let catalog = engine.catalog()?;
             emit(

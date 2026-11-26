@@ -16,6 +16,21 @@ pub struct Productivity {
 }
 
 impl Productivity {
+    pub fn agenda_draft(
+        &self,
+        action: Action,
+        timezone: &str,
+        at: Timestamp,
+    ) -> Result<Vec<crate::Priority>, ProductivityError> {
+        let Action::SaveAgenda { date, .. } = action else {
+            return Err(invalid("需要日计划草稿"));
+        };
+        let mut catalog = self.catalog()?;
+        let (entity, body) = propose(&catalog, action, Uuid::new_v4(), at)?;
+        catalog.validate(&entity, body.is_some())?;
+        catalog.overlay_plan(entity);
+        Ok(catalog.agenda(date, timezone, at)?.priorities)
+    }
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ProductivityError> {
         Ok(Self {
             vault: Vault::open(root.as_ref())?,
@@ -192,6 +207,78 @@ fn propose(
     at: Timestamp,
 ) -> Result<(Entity, Option<String>), ProductivityError> {
     match action {
+        Action::SaveAgenda {
+            date,
+            base,
+            tasks: chosen,
+            slots,
+            routines,
+            budget_minutes: budget,
+            work_windows: windows,
+            buffer_minutes: buffer,
+        } => {
+            if catalog.plan(date)?.map(|plan| &plan.item) != base.as_ref() {
+                return Err(invalid("当天计划已更新，请重新载入后合并选择"));
+            }
+            let (mut entity, body) = daily_plan(catalog, id, date)?;
+            let prior = catalog.planned_tasks(date, Some(&entity));
+            let current = catalog.routines(date, catalog.plan(date)?);
+            if current.keys().ne(routines.keys())
+                || current.iter().any(|(id, old)| {
+                    let draft = &routines[id];
+                    old.title != draft.title || old.minutes != draft.minutes
+                })
+            {
+                return Err(invalid("每日固定任务规则已更新，请重新载入"));
+            }
+            if let Fields::DailyPlan {
+                layout,
+                tasks,
+                priority_tasks,
+                budget_minutes,
+                work_windows,
+                buffer_minutes,
+                closing,
+                ..
+            } = &mut entity.item.fields
+            {
+                if closing.is_some() {
+                    return Err(invalid("当天计划已结案"));
+                }
+                layout
+                    .omitted
+                    .extend(prior.into_iter().filter(|id| !chosen.contains(id)));
+                layout.omitted.retain(|id| !chosen.contains(id));
+                layout.omitted.sort();
+                layout.omitted.dedup();
+                layout.slots = slots;
+                layout.routines = routines;
+                priority_tasks.retain(|id| chosen.contains(id));
+                *tasks = chosen;
+                *budget_minutes = budget;
+                *work_windows = windows;
+                *buffer_minutes = buffer;
+            }
+            Ok((entity, body))
+        }
+        Action::SetRoutineStatus { date, rule, status } => {
+            let (mut entity, body) = daily_plan(catalog, id, date)?;
+            let mut occurrences = catalog.routines(date, Some(&entity));
+            occurrences
+                .get_mut(&rule)
+                .ok_or_else(|| invalid("当天没有此固定任务"))?
+                .status = status;
+            if let Fields::DailyPlan {
+                layout, closing, ..
+            } = &mut entity.item.fields
+            {
+                if closing.is_some() {
+                    return Err(invalid("当天计划已结案"));
+                }
+                layout.routines = occurrences;
+            }
+            Ok((entity, body))
+        }
         Action::ReestimateRemaining { id, minutes } => {
             if minutes == 0 || !catalog.task_open(id) {
                 return Err(invalid("请为未完成任务填写正数分钟"));
@@ -215,6 +302,15 @@ fn propose(
         Action::Create { item, body } => Ok(new_entity(id, item, body)),
         Action::Edit { id, mut item } => {
             let mut entity = catalog.get(id)?.clone();
+            if let (
+                Fields::DailyPlan { layout: old, .. },
+                Fields::DailyPlan { layout, tasks, .. },
+            ) = (&entity.item.fields, &mut item.fields)
+            {
+                layout.clone_from(old);
+                layout.slots.retain(|id, _| tasks.contains(id));
+                layout.omitted.retain(|id| !tasks.contains(id));
+            }
             if let (
                 Fields::Task {
                     focus_sessions: saved,
@@ -279,6 +375,7 @@ fn propose(
             if let Fields::DailyPlan {
                 tasks,
                 priority_tasks,
+                layout,
                 closing,
                 ..
             } = &mut entity.item.fields
@@ -286,6 +383,7 @@ fn propose(
                 if closing.is_some() {
                     return Err(invalid("the daily plan is closed"));
                 }
+                layout.omitted.retain(|id| *id != task);
                 if !tasks.contains(&task) {
                     tasks.push(task);
                 }
@@ -298,11 +396,16 @@ fn propose(
         }
         Action::CloseDay { date, decisions } => {
             let (mut entity, body) = daily_plan(catalog, id, date)?;
-            if let Fields::DailyPlan { closing, .. } = &mut entity.item.fields {
+            let occurrences = catalog.routines(date, Some(&entity));
+            if let Fields::DailyPlan {
+                layout, closing, ..
+            } = &mut entity.item.fields
+            {
                 if closing.is_some() {
                     return Err(invalid("the daily plan is already closed"));
                 }
                 *closing = Some(decisions);
+                layout.routines = occurrences;
             }
             Ok((entity, body))
         }
@@ -449,6 +552,7 @@ fn daily_plan(
         Item {
             title: format!("日计划 {date}"),
             fields: Fields::DailyPlan {
+                layout: PlanLayout::default(),
                 date,
                 tasks: Vec::new(),
                 priority_tasks: Vec::new(),

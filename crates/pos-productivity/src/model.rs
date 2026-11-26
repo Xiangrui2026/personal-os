@@ -1,5 +1,7 @@
+use jiff::civil::Time;
 use jiff::{Timestamp, civil::Date};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -69,6 +71,39 @@ pub struct FocusSession {
     pub intervals: Vec<Interval>,
     pub status: EntryStatus,
     pub running_since: Option<Timestamp>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanSlot {
+    pub start: Time,
+    pub minutes: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineStatus {
+    #[default]
+    Todo,
+    Done,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DailyRoutine {
+    pub title: String,
+    pub minutes: u32,
+    pub start: Option<Time>,
+    pub status: RoutineStatus,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanLayout {
+    #[serde(default)]
+    pub slots: BTreeMap<Uuid, PlanSlot>,
+    #[serde(default)]
+    pub routines: BTreeMap<Uuid, DailyRoutine>,
+    #[serde(default)]
+    pub omitted: Vec<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,6 +179,8 @@ pub enum Fields {
     DailyPlan {
         date: Date,
         #[serde(default)]
+        layout: PlanLayout,
+        #[serde(default)]
         tasks: Vec<Uuid>,
         #[serde(default)]
         priority_tasks: Vec<Uuid>,
@@ -163,6 +200,16 @@ pub enum Fields {
         urgency_percent: Option<u16>,
         #[serde(default)]
         closing: Option<Vec<ClosingDecision>>,
+    },
+    Routine {
+        from: Date,
+        #[serde(default)]
+        until: Option<Date>,
+        minutes: u32,
+        #[serde(default)]
+        start: Option<Time>,
+        #[serde(default)]
+        goal: Option<Uuid>,
     },
     Event {
         interval: Interval,
@@ -185,6 +232,7 @@ pub enum Fields {
 impl Fields {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::Routine { .. } => "routine",
             Self::Goal { .. } => "goal",
             Self::Milestone { .. } => "milestone",
             Self::Project { .. } => "project",
@@ -200,7 +248,10 @@ impl Fields {
         match self {
             Self::Goal { .. } | Self::Milestone { .. } => "Life/Goal",
             Self::Project { .. } | Self::Task { .. } => "Life/Project",
-            Self::DailyPlan { .. } | Self::Event { .. } | Self::TimeBlock { .. } => "Life/Plan",
+            Self::Routine { .. }
+            | Self::DailyPlan { .. }
+            | Self::Event { .. }
+            | Self::TimeBlock { .. } => "Life/Plan",
             Self::TimeEntry { .. } => "Journal",
         }
     }
@@ -253,6 +304,21 @@ pub struct TaskProgress {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
+    SaveAgenda {
+        date: Date,
+        base: Option<Item>,
+        tasks: Vec<Uuid>,
+        slots: BTreeMap<Uuid, PlanSlot>,
+        routines: BTreeMap<Uuid, DailyRoutine>,
+        budget_minutes: Option<u32>,
+        work_windows: Option<Vec<Interval>>,
+        buffer_minutes: u32,
+    },
+    SetRoutineStatus {
+        date: Date,
+        rule: Uuid,
+        status: RoutineStatus,
+    },
     Create {
         item: Item,
         #[serde(default)]

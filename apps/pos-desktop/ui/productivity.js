@@ -4,6 +4,7 @@
   const labels = {
     goal: '目标', milestone: '里程碑', project: '项目', task: '任务',
     daily_plan: '日计划', event: '日程', time_block: '时间块', time_entry: '实际用时',
+    routine: '每日固定任务',
   };
   const statuses = { todo: '待办', doing: '进行中', done: '完成', cancelled: '取消' };
 
@@ -91,17 +92,17 @@
     const content = e('div', { class: 'pos-content' });
     view.notice = notice;
     view.content = content;
-    if (page === 'day') {
+    if (page === 'day' || page === 'agenda') {
       const connection = e('details', { class: 'day-vault', open: !settings.root },
         e('summary', {}, 'Vault 连接'), connect);
       host.replaceChildren(notice, content, connection);
       view.connection = connection;
-      const refresh = setInterval(() => {
+      if (page === 'day') { const refresh = setInterval(() => {
         if (!host.isConnected) { clearInterval(refresh); return; }
         if (document.visibilityState === 'visible' && view.board?.date === nowDate(settings.zone)
             && !host.querySelector('dialog[open], .day-task-options[open], .day-checkpoints[open], .day-settings[open]')
             && !view.connection.open && !view.loading) load(view, true);
-      }, 60000);
+      }, 60000); }
     } else host.replaceChildren(connect, notice, content);
     connect.addEventListener('submit', event => {
       event.preventDefault();
@@ -134,6 +135,7 @@
       const historical = view.page === 'day' && settings.date && settings.date < nowDate(settings.zone) && !latest;
       const data = view.page === 'day'
         ? invoke('day', { root, date: settings.date, timezone: settings.zone, latest })
+        : view.page === 'agenda' ? invoke('agenda', { root, date: settings.date, timezone: settings.zone })
         : view.page === 'roadmap' ? invoke('roadmap', { root }) : Promise.resolve(null);
       const [entries, result] = await Promise.all([historical ? [] : invoke('entities', { root }), data]);
       if (!view.host.isConnected || view.version !== version || (quiet && view.host.querySelector('dialog[open]'))) return;
@@ -144,6 +146,11 @@
         view.board = result;
         settings.date = result.date;
         renderDay(view, result);
+      } else if (view.page === 'agenda') {
+        view.connection.open = false;
+        view.board = result.board;
+        settings.date = result.board.date;
+        window.PosAgenda.render(view, result, { e, action, input, field, message, edit, settings, load, timeText, formDialog, confirm, invoke });
       } else if (view.page === 'roadmap') {
         renderRoadmap(view, result);
       } else {
@@ -211,6 +218,7 @@
     if (!roadmap.length) view.content.append(section('目标路线图', message('暂无目标')));
     for (const group of roadmap) {
       const stages = group.milestones.filter(stage => stage.status !== 'cancelled');
+      const routines = view.entries.filter(item => item.type === 'routine' && item.goal === group.goal.id);
       view.content.append(section(group.goal.title,
         row(statuses[group.goal.status] || '', null, [action('编辑目标', () => edit(view, 'goal', group.goal))]),
         completion(group.goal.title, stages, '个里程碑'),
@@ -218,7 +226,15 @@
         list(group.milestones.map(stage => row(stage.sequence + ' · ' + stage.title,
           [stage.id === group.current_milestone ? '当前阶段' : statuses[stage.status], ...stage.exit_criteria].filter(Boolean).join(' · '),
           [taskProgress(stage), action('编辑', () => edit(view, 'milestone', stage))])), '暂无里程碑'),
-        group.projects.length ? message('关联项目 · ' + group.projects.map(project => project.title).join('、')) : null,
+        ...group.projects.map(project => e('details', { class: 'goal-branch' },
+          e('summary', {}, project.title), list(view.entries.filter(task => task.type === 'task' && task.project === project.id)
+            .map(task => row(task.title, statuses[task.status], [action('编辑', () => edit(view, 'task', task))])), '暂无项目任务'))),
+        e('details', { class: 'goal-branch', open: true }, e('summary', {}, '直属任务'),
+          list(view.entries.filter(task => task.type === 'task' && !task.project &&
+            (task.goals.includes(group.goal.id) || group.milestones.some(stage => stage.id === task.milestone)))
+            .map(task => row(task.title, statuses[task.status], [action('编辑', () => edit(view, 'task', task))])), '暂无直属任务')),
+        routines.length ? e('details', { class:'goal-branch' },e('summary',{},'每日固定任务'),
+          list(routines.map(rule=>row(rule.title,rule.minutes+' 分钟 / 天',[action('编辑规则',()=>edit(view,'routine',rule))])))) : null,
       ));
     }
   }
@@ -313,6 +329,11 @@
       e('input', { type: 'checkbox', name, checked }), e('span', {}, label));
     const controls = [input('title', '标题', current.title || (kind === 'daily_plan' ? '日计划 ' + day : ''), { required: true, readonly: Boolean(sessionOwner) })];
     if (['goal', 'milestone', 'project', 'task'].includes(kind)) controls.push(status());
+    if (kind === 'routine') controls.push(input('from', '从哪天开始', current.from || day, { type:'date', required:true }),
+      input('until', '结束日期（可选）', current.until || '', { type:'date' }),
+      input('minutes', '每天投入（分钟）', current.minutes ?? 30, { type:'number', min:1, max:1440, required:true }),
+      input('start', '固定开始时间（可选）', current.start?.slice(0,5) || '', { type:'time' }),
+      reference('goal', '关联目标', 'goal'));
     if (kind === 'milestone') controls.push(reference('goal', '所属目标', 'goal', true),
       numeric('sequence', '阶段顺序', current.sequence ?? 1, 1),
       input('due_at', '截止时间', current.due_at ? timeText(current.due_at, settings.zone, true) : '', { type: 'datetime-local' }),
@@ -357,6 +378,8 @@
         ? invoke('wall_time', { time: value(name), timezone: settings.zone }) : null;
       const item = { type: kind, title: value('title') };
       if (form.has('status')) item.status = value('status');
+      if (kind === 'routine') Object.assign(item, { from:value('from'), until:value('until') || null,
+        minutes:number('minutes'), start:value('start') || null, goal:value('goal') || null });
       if (kind === 'milestone') Object.assign(item, { goal: value('goal'), sequence: number('sequence'),
         due_at: await instant('due_at'), exit_criteria: lines('exit_criteria') });
       if (kind === 'project') Object.assign(item, { goals: all('goals'), milestones: all('milestones') });
@@ -425,7 +448,7 @@
     } catch (error) { report(view, error); }
   }
 
-  function confirm(view, plan) {
+  function confirm(view, plan, afterApply) {
     if (!plan.vault_id) {
       report(view, '预览已生成。应用变更前需在获准的 Vault 初始化 Change 版本库。');
       return;
@@ -452,6 +475,7 @@
         e('span', {}, '我确认写入此文件，并已暂停其他会修改它的程序。')),
     ], '应用变更', async form => {
       await invoke('apply', { root: view.root, plan, exclusive: form.has('exclusive') });
+      afterApply?.();
       return () => load(view);
     });
   }

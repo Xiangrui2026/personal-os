@@ -1,9 +1,10 @@
 const groups = [
-  { label: '工作区', pages: ['day', 'overview', 'roadmap', 'projects', 'knowledge', 'resources', 'review'] },
+  { label: '工作区', pages: ['agenda', 'day', 'overview', 'roadmap', 'projects', 'knowledge', 'resources', 'review'] },
   { label: '数据管理', pages: ['changes', 'backup'] },
 ];
 
 const pages = {
+  agenda: { label: '规划今天', icon: '\uE8EF', description: '选择任务、分配时间和确认日计划' },
   day: { label: '每日看板', icon: '\uE787', description: '安排任务、日程和专注时间' },
   overview: { label: '总览', icon: '\uE80F' },
   roadmap: { label: '目标路线图', icon: '\uE902', description: '长期目标与阶段里程碑' },
@@ -122,7 +123,7 @@ navigation.innerHTML = groups.map(({ label, pages: ids }) => `
 
 function render({ focus = false } = {}) {
   const hash = window.location.hash.slice(1);
-  const id = Object.hasOwn(pages, hash) ? hash : 'day';
+  const id = Object.hasOwn(pages, hash) ? hash : 'agenda';
   const { label, description } = pages[id];
 
   for (const link of navigation.querySelectorAll('a')) {
@@ -131,7 +132,7 @@ function render({ focus = false } = {}) {
   }
 
   breadcrumb.textContent = label;
-  page.innerHTML = id === 'overview' ? overview() : id === 'day' ? '<div id="productivity"></div>' : `
+  page.innerHTML = id === 'overview' ? overview() : ['day', 'agenda'].includes(id) ? '<div id="productivity"></div>' : `
     <header class="page-heading">
       ${tile(id)}
       <h1 id="page-title">${label}</h1>

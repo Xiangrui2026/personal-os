@@ -1,4 +1,6 @@
+mod agenda;
 mod board;
+pub use agenda::Agenda;
 mod catalog;
 mod history;
 mod model;

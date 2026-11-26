@@ -6,6 +6,8 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             productivity::day,
+            productivity::agenda,
+            productivity::agenda_priorities,
             productivity::roadmap,
             productivity::entities,
             productivity::startup_vault,

@@ -45,6 +45,9 @@ pub struct DayTotals {
 
 #[derive(Debug, Serialize)]
 pub struct DayBoard {
+    pub routines: BTreeMap<Uuid, DailyRoutine>,
+    pub routine_week_done: BTreeMap<Uuid, usize>,
+    pub routine_week: BTreeMap<Uuid, [Option<RoutineStatus>; 7]>,
     pub date: Date,
     pub timezone: String,
     pub window: Interval,
@@ -122,7 +125,7 @@ impl Catalog {
     ) -> Result<DayBoard, ProductivityError> {
         let zone = TimeZone::get(timezone)?;
         let first = date.to_zoned(zone.clone())?.timestamp();
-        let last = date.tomorrow()?.to_zoned(zone)?.timestamp();
+        let last = date.tomorrow()?.to_zoned(zone.clone())?.timestamp();
         let window = Interval {
             start: first,
             end: last,
@@ -145,7 +148,25 @@ impl Catalog {
             ),
             _ => (&[][..], &[][..], None, 0),
         };
-        let mut scheduled = Vec::new();
+        let routines = self.routines(date, plan);
+        let mut routine_week_done = BTreeMap::new();
+        let mut routine_week = BTreeMap::new();
+        let mut previous = date;
+        for index in (0..7).rev() {
+            if let Some(Fields::DailyPlan { layout, .. }) =
+                self.plan(previous)?.map(|p| &p.item.fields)
+            {
+                for (id, occurrence) in &layout.routines {
+                    routine_week.entry(*id).or_insert([None; 7])[index] = Some(occurrence.status);
+                    if occurrence.status == RoutineStatus::Done {
+                        *routine_week_done.entry(*id).or_default() += 1;
+                    }
+                }
+            }
+            let Ok(day) = previous.yesterday() else { break };
+            previous = day;
+        }
+        let mut scheduled = self.agenda_slots(date, &zone, plan, &routines)?;
         let mut actual = Vec::new();
         for entity in self.entities() {
             match &entity.item.fields {
@@ -194,7 +215,7 @@ impl Catalog {
             planned_work_seconds: union_seconds(
                 scheduled
                     .iter()
-                    .filter(|item| item.kind == "time_block")
+                    .filter(|item| matches!(item.kind, "time_block" | "plan_slot" | "routine"))
                     .map(|item| item.interval),
             ),
             fixed_event_seconds: union_seconds(
@@ -205,7 +226,11 @@ impl Catalog {
             ),
             actual_seconds: union_seconds(actual.iter().map(|item| item.interval)),
             available_work_minutes: None,
-            remaining_estimate_minutes: 0,
+            remaining_estimate_minutes: routines
+                .values()
+                .filter(|r| r.status == RoutineStatus::Todo)
+                .map(|r| u64::from(r.minutes))
+                .sum(),
             unestimated_tasks: 0,
             exhausted_estimates: 0,
         };
@@ -219,34 +244,16 @@ impl Catalog {
             if historical && self.get(id).is_err() {
                 continue;
             }
-            let entity = self.require(id, "task")?;
-            let Fields::Task {
-                status,
-                depends_on,
-                estimate_minutes,
-                initial_estimate_minutes,
-                ..
-            } = &entity.item.fields
-            else {
-                return Err(invalid("planned entity must be a task"));
+            let row = self.task_row(
+                id,
+                priorities.contains(&id),
+                planned_tasks.contains(&id),
+                &actual,
+                now,
+            )?;
+            let Fields::Task { status, .. } = &row.task.item.fields else {
+                unreachable!()
             };
-            let actual_seconds = union_seconds(
-                actual
-                    .iter()
-                    .filter(|item| item.task == Some(id))
-                    .map(|item| item.interval),
-            );
-            let total_actual_seconds = union_seconds(self.entities().filter(|item|
-                matches!(item.item.fields, Fields::TimeEntry { task, .. } if task == id)
-            ).flat_map(|entry| entry_intervals(entry, now)));
-            let estimated_remainder =
-                estimate_minutes
-                    .or(*initial_estimate_minutes)
-                    .map(|estimate| {
-                        (f64::from(estimate) - total_actual_seconds as f64 / 60.0).max(0.0)
-                    });
-            let needs_reestimate = status.is_open() && estimated_remainder == Some(0.0);
-            let remaining_minutes = estimated_remainder.filter(|_| !needs_reestimate);
             if *status == WorkStatus::Done {
                 totals.completed += 1;
             }
@@ -254,36 +261,15 @@ impl Catalog {
                 totals.tasks += 1;
             }
             if status.is_open() {
-                if let Some(remaining) = remaining_minutes {
+                if let Some(remaining) = row.remaining_minutes {
                     totals.remaining_estimate_minutes += remaining.ceil() as u64;
-                } else if needs_reestimate {
+                } else if row.needs_reestimate {
                     totals.exhausted_estimates += 1;
                 } else {
                     totals.unestimated_tasks += 1;
                 }
             }
-            let mut blockers = Vec::new();
-            for dependency in depends_on {
-                if !matches!(
-                    self.get(*dependency).map(|other| &other.item.fields),
-                    Ok(Fields::Task {
-                        status: WorkStatus::Done,
-                        ..
-                    })
-                ) {
-                    blockers.push(*dependency);
-                }
-            }
-            board_tasks.push(BoardTask {
-                task: entity.clone(),
-                priority: priorities.contains(&id),
-                planned: planned_tasks.contains(&id),
-                blockers,
-                actual_seconds,
-                total_actual_seconds,
-                remaining_minutes,
-                needs_reestimate,
-            });
+            board_tasks.push(row);
         }
         board_tasks.sort_by_key(|row| {
             (
@@ -369,6 +355,9 @@ impl Catalog {
             window,
         );
         Ok(DayBoard {
+            routines,
+            routine_week_done,
+            routine_week,
             date,
             timezone: timezone.into(),
             window,
@@ -389,6 +378,66 @@ impl Catalog {
             journal_path: None,
             snapshot_entities: None,
             planning,
+        })
+    }
+    pub(crate) fn task_row(
+        &self,
+        id: Uuid,
+        priority: bool,
+        planned: bool,
+        actual: &[TimelineItem],
+        now: Timestamp,
+    ) -> Result<BoardTask, ProductivityError> {
+        let entity = self.require(id, "task")?;
+        let Fields::Task {
+            status,
+            depends_on,
+            estimate_minutes,
+            initial_estimate_minutes,
+            ..
+        } = &entity.item.fields
+        else {
+            return Err(invalid("planned entity must be a task"));
+        };
+        let actual_seconds = union_seconds(
+            actual
+                .iter()
+                .filter(|item| item.task == Some(id))
+                .map(|item| item.interval),
+        );
+        let total_actual_seconds = union_seconds(
+            self.entities()
+                .filter(
+                    |item| matches!(item.item.fields, Fields::TimeEntry { task, .. } if task == id),
+                )
+                .flat_map(|entry| entry_intervals(entry, now)),
+        );
+        let estimated_remainder = estimate_minutes
+            .or(*initial_estimate_minutes)
+            .map(|estimate| (f64::from(estimate) - total_actual_seconds as f64 / 60.0).max(0.0));
+        let needs_reestimate = status.is_open() && estimated_remainder == Some(0.0);
+        let remaining_minutes = estimated_remainder.filter(|_| !needs_reestimate);
+        let mut blockers = Vec::new();
+        for dependency in depends_on {
+            if !matches!(
+                self.get(*dependency).map(|other| &other.item.fields),
+                Ok(Fields::Task {
+                    status: WorkStatus::Done,
+                    ..
+                })
+            ) {
+                blockers.push(*dependency);
+            }
+        }
+        Ok(BoardTask {
+            task: entity.clone(),
+            priority,
+            planned,
+            blockers,
+            actual_seconds,
+            total_actual_seconds,
+            remaining_minutes,
+            needs_reestimate,
         })
     }
 }
